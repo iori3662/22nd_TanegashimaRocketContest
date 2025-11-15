@@ -1,25 +1,3 @@
-"""
-TB6612FNG 用モータードライバサンプル
-
-Raspberry Pi 4 上で TB6612FNG を使い、モーターを2つ制御するためのシンプルなクラスと
-サンプル実行コードを含みます。
-
-配線メモ（例）:
-  - モータA: AIN1 -> GPIO17, AIN2 -> GPIO27, PWMA -> GPIO18 (PWM)
-  - モータB: BIN1 -> GPIO22, BIN2 -> GPIO23, PWMB -> GPIO24 (PWM)
-  - STBY  -> GPIO25
-  - 5V とモーター電源は TB6612FNG の Vcc/MotorVcc に接続（電源の極性・電圧に注意）
-  - GND を Raspberry Pi の GND と共通にする
-
-使い方:
-  - TB6612Driver クラスを作成し、set_motor('A', speed) / set_motor('B', speed) を呼ぶ。
-  - speed は -100 〜 100 の範囲。正は前進、負は後進、0 は停止。
-
-注意:
-  - 実行には root 権限が必要な場合があります（PWM の使用など）。
-  - RPi.GPIO がインストールされていない環境でのテストのために、軽いモックを内蔵しています。
-"""
-
 from time import sleep
 from typing import Optional
 
