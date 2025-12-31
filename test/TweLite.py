@@ -1,16 +1,27 @@
 import serial
-import serial.tools.list_ports
+import time
 
-# 'COM2' 9600bps Parityなしの場合
-Serial_Port=serial.Serial(port='COM2', baudrate=9600, parity= 'N')
+ser = serial.Serial(
+    port='/dev/ttyAMA0',   
+    baudrate=115200,
+    timeout=0.1
+)
 
-#送信(tx)
-data=input()+'\r\n'
-data=data.encode('utf-8')
-Serial_Port.write(data)
+time.sleep(1)
+print("UART connected")
 
-#受信(rx)
-data=Serial_Port.readline() # 1byte受信なら data=Serial_Port.read(1)
-data=data.strip()
-data=data.decode('utf-8')
-print(data)
+try:
+    while True:
+        ser.write(b"HELLO TWELITE\n")
+
+        if ser.in_waiting > 0:
+            line = ser.readline().decode('utf-8', errors='ignore').strip()
+            print("RX:", line)
+
+        time.sleep(1)
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    ser.close()
