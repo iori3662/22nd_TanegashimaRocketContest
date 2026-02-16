@@ -16,7 +16,7 @@ def main():
     try:
         while True:
             frame = picam2.capture_array() 
-            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
             cv2.imshow("Picamera2 (OpenCV)", frame_bgr)
 
