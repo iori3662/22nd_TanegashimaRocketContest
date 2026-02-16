@@ -3,7 +3,7 @@ import sys
 import time
 import select
 
-PORT = "/dev/ttyUSB0"
+PORT = "/dev/serial0"
 BAUD = 38400
 
 def main():

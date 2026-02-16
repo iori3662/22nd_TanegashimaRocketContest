@@ -13,7 +13,7 @@ import pynmea2
 # ==========================================
 # 設定
 # ==========================================
-TWELITE_PORT = "/dev/ttyUSB0"
+TWELITE_PORT = "/dev/serial0"
 TWELITE_BAUD = 38400
 
 GPS_I2C_BUS = 1
@@ -58,7 +58,7 @@ def main():
     print(f"TWELITEポート {TWELITE_PORT} をオープンしました")
 
     # ---------- I2C (BNO055, BME280) ----------
-    i2c = busio.I2C(board.SCL, board.SDA)
+    i2c = board.I2C()
     bno055 = adafruit_bno055.BNO055_I2C(i2c, address=0x28)
     bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=0x76)
     bme280.sea_level_pressure = 1013.25  # 必要に応じて現地値へ

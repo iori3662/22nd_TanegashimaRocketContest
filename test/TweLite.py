@@ -5,7 +5,7 @@ import sys
 # ===== ユーザ設定 =====
 # MONOSTICK/USB接続なら: "/dev/ttyUSB0" or "/dev/ttyACM0"
 # GPIO UARTなら: "/dev/serial0"
-PORT = "/dev/ttyUSB0"
+PORT = "/dev/serial0"
 BAUD = 38400  # TWELITE側の設定と合わせる
 
 def open_serial():
