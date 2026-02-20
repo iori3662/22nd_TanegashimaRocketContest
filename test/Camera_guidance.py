@@ -159,6 +159,7 @@ def main():
 
             # ---- 表示用：RGB→BGRにしてimshow（これで赤青逆転が直る）----
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            
 
             # デバッグ描画
             cv2.line(frame_bgr, (cx_frame, 0), (cx_frame, H), (255, 255, 255), 1)

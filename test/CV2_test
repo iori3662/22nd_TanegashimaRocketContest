@@ -6,7 +6,7 @@ W, H = 640, 480
 
 picam2 = Picamera2()
 config = picam2.create_preview_configuration(
-    main={"format": "RGB888", "size": (W, H)}   # ‚¢‚Á‚½‚ñRGB‚ÅŒÅ’è
+    main={"format": "RGB888", "size": (W, H)}   # ã„ã£ãŸã‚“RGBã§å›ºå®š
 )
 picam2.configure(config)
 picam2.start()
@@ -14,12 +14,12 @@ time.sleep(0.2)
 
 try:
     while True:
-        frame = picam2.capture_array("main")  # ‚±‚ê‚ÍRGB‚Ì‚Í‚¸iÝ’è’Ê‚è‚È‚çj
+        frame = picam2.capture_array("main")  # ã“ã‚Œã¯RGBã®ã¯ãšï¼ˆè¨­å®šé€šã‚Šãªã‚‰ï¼‰
 
-        # ‚»‚Ì‚Ü‚Ü•\Ž¦iOpenCV‚ÍBGR‘O’ñ‚È‚Ì‚ÅF‚ª•Ï‚ÉŒ©‚¦‚é‚Í‚¸j
+        # ãã®ã¾ã¾è¡¨ç¤ºï¼ˆOpenCVã¯BGRå‰æãªã®ã§è‰²ãŒå¤‰ã«è¦‹ãˆã‚‹ã¯ãšï¼‰
         cv2.imshow("RAW (as-is)", frame)
 
-        # RGB¨BGR‚É‚µ‚Ä•\Ž¦i‚±‚Á‚¿‚ªŒ»ŽÀ‚ÌF‚É‡‚¤‚È‚ç“ü—Í‚ÍRGBŠm’èj
+        # RGBâ†’BGRã«ã—ã¦è¡¨ç¤ºï¼ˆã“ã£ã¡ãŒç¾å®Ÿã®è‰²ã«åˆã†ãªã‚‰å…¥åŠ›ã¯RGBç¢ºå®šï¼‰
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         cv2.imshow("RGB->BGR (should look real)", frame_bgr)
 
