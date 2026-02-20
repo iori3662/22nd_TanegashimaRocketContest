@@ -13,21 +13,20 @@ SERVO_R_PIN = 12  # GPIO12 (Right)
 STOP_L = 1480
 STOP_R = 1490
 
-# 停止からの最大変位(us)（大きいほど速いが不安定になりやすい）
 MAX_DELTA = 350
 
 # =========================
 # Control tuning
 # =========================
-Kp_turn = 0.9          # 旋回ゲイン（0.6〜1.5あたりで調整）
-BASE_FWD = 220         # 前進ベース (us)
-SEARCH_TURN = 170      # 見失い時の探索旋回 (us)
+Kp_turn = 0.9
+BASE_FWD = 220
+SEARCH_TURN = 170
 
-AREA_TRACK_TH = 800    # この面積以上で「追跡対象あり」
-AREA_FWD_TH = 1500     # この面積以上で前進を強める（近づいたら上げる/下げる）
+AREA_TRACK_TH = 900     # 三角形の面積しきい値（環境で調整）
+AREA_FWD_TH = 2200      # これ以上なら前進強め
 
 # =========================
-# Red detection settings
+# Red detection settings (HSV)
 # =========================
 lower_red1 = np.array([0, 120, 70], dtype=np.uint8)
 upper_red1 = np.array([10, 255, 255], dtype=np.uint8)
@@ -39,10 +38,7 @@ def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
 def set_diff_drive(pi, fwd_us, turn_us):
-    """
-    fwd_us : 前進成分 (+で前進)
-    turn_us: 旋回成分 (+で右旋回, -で左旋回) ※逆なら符号を反転して調整
-    """
+    # turn_us: +で右旋回（逆なら符号反転で調整）
     cmd_l = STOP_L + fwd_us + turn_us
     cmd_r = STOP_R + fwd_us - turn_us
 
@@ -55,6 +51,39 @@ def set_diff_drive(pi, fwd_us, turn_us):
 def stop(pi):
     pi.set_servo_pulsewidth(SERVO_L_PIN, STOP_L)
     pi.set_servo_pulsewidth(SERVO_R_PIN, STOP_R)
+
+def is_triangle_like(contour, min_area=AREA_TRACK_TH):
+    """
+    赤コーンの「三角形っぽさ」を輪郭で判定。
+    - 面積が小さすぎるものは捨てる
+    - approxPolyDPで頂点が3なら三角形扱い
+    - ついでに「細すぎ/潰れすぎ」を除外（バウンディング比）
+    """
+    area = cv2.contourArea(contour)
+    if area < min_area:
+        return False, None, area
+
+    peri = cv2.arcLength(contour, True)
+    eps = 0.04 * peri  # 0.03〜0.06で調整（小さいほど厳密）
+    approx = cv2.approxPolyDP(contour, eps, True)
+
+    if len(approx) != 3:
+        return False, approx, area
+
+    x, y, w, h = cv2.boundingRect(approx)
+    if h == 0:
+        return False, approx, area
+    aspect = w / h
+
+    # 三角形（コーン）はだいたい縦長〜正方に近いはず、極端な横長を除外
+    if aspect > 1.6:
+        return False, approx, area
+
+    # 凸性チェック（必須ではないが誤検出低減）
+    if not cv2.isContourConvex(approx):
+        return False, approx, area
+
+    return True, approx, area
 
 def main():
     # ---- pigpio ----
@@ -72,7 +101,6 @@ def main():
     picam2.start()
     time.sleep(0.2)
 
-    # 初期停止
     stop(pi)
     time.sleep(0.3)
 
@@ -80,15 +108,13 @@ def main():
 
     try:
         while True:
-            # Picamera2: "RGB888" で取得 → OpenCV処理用にBGRへ変換
             frame_rgb = picam2.capture_array("main")
             if frame_rgb is None or frame_rgb.size == 0:
                 stop(pi)
                 continue
 
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-
-            hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+            # ★重要：判定はRGB→HSVでやる（BGR2HSVにしない）
+            hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
 
             mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
             mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
@@ -98,60 +124,63 @@ def main():
 
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-            if contours:
-                c = max(contours, key=cv2.contourArea)
-                area = cv2.contourArea(c)
+            # 三角形だけ抽出して最大をターゲットに
+            best = None
+            best_area = 0
+            best_approx = None
 
-                if area >= AREA_TRACK_TH:
-                    M = cv2.moments(c)
-                    if M["m00"] > 0:
-                        cx = int(M["m10"] / M["m00"])
+            for c in contours:
+                ok, approx, area = is_triangle_like(c)
+                if ok and area > best_area:
+                    best = c
+                    best_area = area
+                    best_approx = approx
 
-                        # 画像中心からの正規化誤差（-1〜+1）
-                        err = (cx - cx_frame) / (W / 2.0)
-
-                        # 旋回量(us)
-                        turn = int(Kp_turn * err * MAX_DELTA)
-
-                        # 前進量(us)：赤が大きいほど強める（雑に2段階）
-                        fwd = BASE_FWD if area < AREA_FWD_TH else int(BASE_FWD * 1.2)
-
-                        set_diff_drive(pi, fwd_us=fwd, turn_us=turn)
-
-                        # ---- 可視化（デバッグ）----
-                        x, y, w, h = cv2.boundingRect(c)
-                        cv2.rectangle(frame_bgr, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        cv2.circle(frame_bgr, (cx, int(M["m01"] / M["m00"])), 4, (0, 255, 0), -1)
-                        cv2.putText(frame_bgr, f"RED area={int(area)} err={err:.2f}",
-                                    (x, max(0, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    else:
-                        # モーメントが取れない場合は探索
-                        set_diff_drive(pi, fwd_us=0, turn_us=SEARCH_TURN)
-                else:
-                    # 小さすぎ＝見失い扱い
-                    set_diff_drive(pi, fwd_us=0, turn_us=SEARCH_TURN)
-            else:
+            if best is None:
                 # 見失い：探索旋回
                 set_diff_drive(pi, fwd_us=0, turn_us=SEARCH_TURN)
+                target_info = "NO TRIANGLE"
+            else:
+                M = cv2.moments(best)
+                if M["m00"] <= 0:
+                    set_diff_drive(pi, fwd_us=0, turn_us=SEARCH_TURN)
+                    target_info = "M00=0"
+                else:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
 
-            # 画面中心線（デバッグ）
+                    err = (cx - cx_frame) / (W / 2.0)
+                    turn = int(Kp_turn * err * MAX_DELTA)
+
+                    fwd = BASE_FWD if best_area < AREA_FWD_TH else int(BASE_FWD * 1.2)
+                    set_diff_drive(pi, fwd_us=fwd, turn_us=turn)
+
+                    target_info = f"TRI area={int(best_area)} err={err:.2f}"
+
+            # ---- 表示用：RGB→BGRにしてimshow（これで赤青逆転が直る）----
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            # デバッグ描画
             cv2.line(frame_bgr, (cx_frame, 0), (cx_frame, H), (255, 255, 255), 1)
+            cv2.putText(frame_bgr, target_info, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            if best_approx is not None:
+                cv2.drawContours(frame_bgr, [best_approx], -1, (0, 255, 0), 2)
 
             cv2.imshow("Camera", frame_bgr)
             cv2.imshow("Red Mask", mask)
 
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q") or key == 27:  # q or ESC
+            if key == ord("q") or key == 27:
                 break
 
     finally:
-        # 停止 → フリー → 終了
         stop(pi)
         time.sleep(0.2)
         pi.set_servo_pulsewidth(SERVO_L_PIN, 0)
         pi.set_servo_pulsewidth(SERVO_R_PIN, 0)
         pi.stop()
-
         picam2.stop()
         cv2.destroyAllWindows()
 
