@@ -10,10 +10,10 @@ import time
 SERVO_L_PIN = 18  # GPIO18 (Left)
 SERVO_R_PIN = 12  # GPIO12 (Right)
 
-STOP_L = 1480
+STOP_L = 1490
 STOP_R = 1490
 
-MAX_DELTA = 350
+MAX_DELTA = 990
 
 # =========================
 # Control tuning
@@ -92,7 +92,7 @@ def main():
         raise RuntimeError("pigpioに接続できません。sudo pigpiod を実行してください。")
 
     # ---- Picamera2 ----
-    W, H = 640, 480
+    W, H = 480, 640
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
         main={"format": "RGB888", "size": (W, H)}
