@@ -10,7 +10,7 @@ import time
 SERVO_L_PIN = 18  # GPIO18 (Left)
 SERVO_R_PIN = 12  # GPIO12 (Right)
 
-STOP_L = 1490
+STOP_L = 1480
 STOP_R = 1490
 
 MAX_DELTA = 990
@@ -92,7 +92,7 @@ def main():
         raise RuntimeError("pigpioに接続できません。sudo pigpiod を実行してください。")
 
     # ---- Picamera2 ----
-    W, H = 480, 640
+    W, H = 640, 480
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
         main={"format": "RGB888", "size": (W, H)}
@@ -159,7 +159,6 @@ def main():
 
             # ---- 表示用：RGB→BGRにしてimshow（これで赤青逆転が直る）----
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            
 
             # デバッグ描画
             cv2.line(frame_bgr, (cx_frame, 0), (cx_frame, H), (255, 255, 255), 1)
