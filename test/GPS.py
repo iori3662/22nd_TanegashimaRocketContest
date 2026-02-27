@@ -51,6 +51,7 @@ with SMBus(BUS) as bus:
 
             try:
                 msg = pynmea2.parse(s)
+                #print(msg)
             except pynmea2.ParseError:
                 continue
 
@@ -93,6 +94,7 @@ with SMBus(BUS) as bus:
                     f"fixq={latest['fixq']}, nsat={latest['nsat']}, hdop={latest['hdop']}"
                 )
             else:
-                print("no valid fix yet (waiting...)")
+                print("No detect")
+
 
         time.sleep(0.05)

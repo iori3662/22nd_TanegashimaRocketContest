@@ -16,9 +16,12 @@ def main():
     try:
         while True:
             frame = picam2.capture_array() 
+            hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-            cv2.imshow("Picamera2 (OpenCV)", frame_bgr)
+            cv2.imshow("Picamera2 (OpenCV)", frame)
+            cv2.imshow("BGR (OpenCV)", frame_bgr)
+            cv2.imshow("HSV (OpenCV)", hsv)
 
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
