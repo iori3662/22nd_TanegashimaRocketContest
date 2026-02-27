@@ -95,7 +95,7 @@ def main():
     W, H = 640, 480
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
-        main={"format": "RGB888", "size": (W, H)}
+        main={"format": "BGR888", "size": (W, H)}
     )
     picam2.configure(config)
     picam2.start()
@@ -108,13 +108,13 @@ def main():
 
     try:
         while True:
-            frame_rgb = picam2.capture_array("main")
-            if frame_rgb is None or frame_rgb.size == 0:
+            frame_bgr = picam2.capture_array("main")
+            if frame_bgr is None or frame_bgr.size == 0:
                 stop(pi)
                 continue
 
             # ★重要：判定はRGB→HSVでやる（BGR2HSVにしない）
-            hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+            hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_RGB2HSV)
 
             mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
             mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
@@ -158,17 +158,17 @@ def main():
                     target_info = f"TRI area={int(best_area)} err={err:.2f}"
 
             # ---- 表示用：RGB→BGRにしてimshow（これで赤青逆転が直る）----
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
             # デバッグ描画
-            cv2.line(frame_bgr, (cx_frame, 0), (cx_frame, H), (255, 255, 255), 1)
-            cv2.putText(frame_bgr, target_info, (10, 30),
+            cv2.line(frame_rgb, (cx_frame, 0), (cx_frame, H), (255, 255, 255), 1)
+            cv2.putText(frame_rgb, target_info, (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             if best_approx is not None:
-                cv2.drawContours(frame_bgr, [best_approx], -1, (0, 255, 0), 2)
+                cv2.drawContours(frame_rgb, [best_approx], -1, (0, 255, 0), 2)
 
-            cv2.imshow("Camera", frame_bgr)
+            cv2.imshow("Camera", frame_rgb)
             cv2.imshow("Red Mask", mask)
 
             key = cv2.waitKey(1) & 0xFF

@@ -1,5 +1,6 @@
-from smbus2 import SMBus
+import asyncio
 import time
+from smbus2 import SMBus
 import pynmea2
 
 import board
@@ -7,20 +8,29 @@ import busio
 import adafruit_bno055
 from adafruit_bme280 import basic as adafruit_bme280
 
+from bleak import BleakClient
 
 # =======================
-# Config
+# BLE Config
+# =======================
+ADDR = "58:8C:81:AE:A8:1A"  # XIAOのMAC（あなたの環境の値）
+LOG_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+SEND_HZ = 10.0  # XIAOへ送る周期（UIが滑らかになる）
+SEND_DT = 1.0 / SEND_HZ
+
+# =======================
+# Sensor Config
 # =======================
 BUS = 1
-GPS_ADDR = 0x42         # SAM-M8Q I2C address
+GPS_ADDR = 0x42
 BNO_ADDR = 0x28
 BME_ADDR = 0x76
 
-IMU_HZ = 10.0           # BNO055/BME280 print rate
-GPS_HZ = 1.0            # GPS print rate
-GPS_READ_LEN = 32       # bytes per i2c read
-GPS_SLEEP = 0.02        # loop sleep (s)
-
+IMU_HZ = 10.0
+GPS_HZ = 1.0
+GPS_READ_LEN = 32
+GPS_SLEEP = 0.02
 
 # =======================
 # Helpers
@@ -39,13 +49,8 @@ def dm_to_deg(dm, direction):
 
 
 def parse_nmea_from_buffer(buf, latest):
-    """
-    buf: bytearray (will be mutated by caller)
-    latest: dict updated in-place
-    returns: new buf (bytearray)
-    """
-    while b'\n' in buf:
-        line, _, rest = buf.partition(b'\n')
+    while b"\n" in buf:
+        line, _, rest = buf.partition(b"\n")
         buf = bytearray(rest)
 
         s = line.decode("ascii", errors="ignore").strip()
@@ -90,10 +95,37 @@ def parse_nmea_from_buffer(buf, latest):
     return buf
 
 
+def safe_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def build_ascii_line(seq: int, phase: int, vbat_mV: int,
+                     yaw_deg, pitch_deg, roll_deg,
+                     lat, lon, alt,
+                     temp_c, press_hpa, hum_pct):
+    # XIAO側のパーサに合わせたキーを最低限含める
+    # 文字数削減のため小数点を抑える（必要なら増やせる）
+    def f(v, fmt):
+        if v is None:
+            return "nan"
+        return format(v, fmt)
+
+    line = (
+        f"SEQ={seq},PH={phase},VBAT={vbat_mV},"
+        f"Y={f(yaw_deg, '.1f')},P={f(pitch_deg, '.1f')},R={f(roll_deg, '.1f')},"
+        f"LAT={f(lat, '.6f')},LON={f(lon, '.6f')},ALT={f(alt, '.1f')},"
+        f"T={f(temp_c, '.1f')},Pr={f(press_hpa, '.1f')},H={f(hum_pct, '.1f')}\n"
+    )
+    return line.encode("ascii", errors="ignore")
+
+
 # =======================
-# Main
+# Main BLE loop
 # =======================
-def main():
+async def telemetry_loop():
     # --- Sensors (CircuitPython stack) ---
     i2c = busio.I2C(board.SCL, board.SDA)
     bno055 = adafruit_bno055.BNO055_I2C(i2c, address=BNO_ADDR)
@@ -104,69 +136,95 @@ def main():
     buf = bytearray()
     latest = {"lat": None, "lon": None, "alt": None, "fixq": 0, "nsat": 0, "hdop": None}
 
-    next_gps_print = time.monotonic()
-    next_imu_print = time.monotonic()
+    # --- Dummy fields you will later replace with real phase/vbat ---
+    phase = 0
+    vbat_mV = 7400  # TODO: 実機ではADCやPi側電圧計測値に置き換え
 
-    print("Unified I2C start:")
-    print(f"  GPS(SAM-M8Q) I2C=0x{GPS_ADDR:02X} @ {GPS_HZ:.1f} Hz (latest fix)")
-    print(f"  BNO055/BME280 @ {IMU_HZ:.1f} Hz")
-    print("Note: Two I2C stacks share the same bus (works often, but may cause contention).")
+    seq = 0
+    next_send = time.monotonic()
+    next_imu_tick = time.monotonic()
+    imu_dt = 1.0 / IMU_HZ
 
     with SMBus(BUS) as bus:
-        while True:
-            now = time.monotonic()
+        async with BleakClient(ADDR) as client:
+            await client.connect()
+            print("Connected:", client.is_connected)
 
-            # -------- GPS read/parse (continuous, robust) --------
-            try:
-                data = bus.read_i2c_block_data(GPS_ADDR, 0xFF, GPS_READ_LEN)
-                buf.extend(data)
-                buf = parse_nmea_from_buffer(buf, latest)
-            except OSError:
-                # e.g., Errno 121: remote I/O error
-                pass
+            while True:
+                now = time.monotonic()
 
-            # -------- IMU/BME print (10 Hz) --------
-            if now >= next_imu_print:
-                next_imu_print += 1.0 / IMU_HZ
+                # -------- GPS read/parse (continuous) --------
+                try:
+                    data = bus.read_i2c_block_data(GPS_ADDR, 0xFF, GPS_READ_LEN)
+                    buf.extend(data)
+                    buf = parse_nmea_from_buffer(buf, latest)
+                except OSError:
+                    pass
 
-                euler = bno055.euler
-                gyro = bno055.gyro
-                accel = bno055.acceleration
-                mag = bno055.magnetic
-                calib = bno055.calibration_status
+                # -------- IMU/BME sampling at IMU_HZ --------
+                # 送信が10Hzなら、IMUも同じ周期で読む（過剰読みによるI2C負荷を避ける）
+                yaw_deg = pitch_deg = roll_deg = None
+                temp_c = press_hpa = hum_pct = None
 
-                print("\n[IMU+BME]")
-                if euler is not None:
-                    print(f"  Euler(deg) H={euler[0]:6.2f} R={euler[1]:6.2f} P={euler[2]:6.2f}")
-                else:
-                    print("  Euler(deg) not available yet")
+                if now >= next_imu_tick:
+                    next_imu_tick += imu_dt
 
-                print(f"  Gyro(rad/s)  {gyro}")
-                print(f"  Accel(m/s^2) {accel}")
-                print(f"  Mag(uT)      {mag}")
-                print(f"  Calib(sys,g,a,m) {calib}")
+                    euler = bno055.euler  # (heading, roll, pitch) [deg] or None
+                    if euler is not None:
+                        # euler[0]=heading(yaw), euler[1]=roll, euler[2]=pitch
+                        yaw_deg = safe_float(euler[0])
+                        roll_deg = safe_float(euler[1])
+                        pitch_deg = safe_float(euler[2])
 
-                print(f"  Temp(C)      {bme280.temperature:.2f}")
-                print(f"  Press(hPa)   {bme280.pressure:.2f}")
-                print(f"  Humidity(%)  {bme280.humidity:.2f}")
-                print(f"  Alt(m)       {bme280.altitude:.2f}")
+                    temp_c = safe_float(bme280.temperature)
+                    press_hpa = safe_float(bme280.pressure)
+                    hum_pct = safe_float(bme280.humidity)
 
-            # -------- GPS print (1 Hz) --------
-            if now >= next_gps_print:
-                next_gps_print += 1.0 / GPS_HZ
-                print("\n[GPS]")
-                if latest["lat"] is not None and latest["lon"] is not None and latest["fixq"] > 0:
-                    alt = latest["alt"]
-                    alt_str = f"{alt:.1f} m" if alt is not None else "None"
-                    print(
-                        f"  lat={latest['lat']:.8f}, lon={latest['lon']:.8f}, alt={alt_str}, "
-                        f"fixq={latest['fixq']}, nsat={latest['nsat']}, hdop={latest['hdop']}"
+                # -------- Send at SEND_HZ --------
+                if now >= next_send:
+                    next_send += SEND_DT
+
+                    lat = latest["lat"] if latest["fixq"] > 0 else None
+                    lon = latest["lon"] if latest["fixq"] > 0 else None
+                    alt = latest["alt"] if latest["fixq"] > 0 else None
+
+                    payload = build_ascii_line(
+                        seq=seq,
+                        phase=phase,
+                        vbat_mV=vbat_mV,
+                        yaw_deg=yaw_deg,
+                        pitch_deg=pitch_deg,
+                        roll_deg=roll_deg,
+                        lat=lat,
+                        lon=lon,
+                        alt=alt,
+                        temp_c=temp_c,
+                        press_hpa=press_hpa,
+                        hum_pct=hum_pct,
                     )
-                else:
-                    print("  no valid fix yet (waiting...)")
 
-            time.sleep(GPS_SLEEP)
+                    # response=Trueで確実に失敗を拾う（安定したらFalseへ）
+                    await client.write_gatt_char(LOG_UUID, payload, response=True)
+
+                    if seq % 20 == 0:
+                        print(payload.decode("ascii", errors="ignore").strip())
+
+                    seq += 1
+
+                await asyncio.sleep(GPS_SLEEP)
+
+
+async def main():
+    while True:
+        try:
+            await telemetry_loop()
+        except KeyboardInterrupt:
+            print("\nStopped by user.")
+            return
+        except Exception as e:
+            print("error (retry):", repr(e))
+            await asyncio.sleep(1.0)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
