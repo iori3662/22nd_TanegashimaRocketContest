@@ -1,5 +1,4 @@
 import asyncio
-import math
 import time
 from smbus2 import SMBus
 import pynmea2
@@ -15,7 +14,7 @@ from bleak.exc import BleakError
 # =======================
 # BLE Config
 # =======================
-ADDR = "58:8C:81:AE:A8:1A"
+ADDR = "58:8C:81:AE:A8:1A"  # XIAOのMACアドレス
 LOG_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 
 SEND_HZ = 10.0
@@ -101,6 +100,8 @@ def build_line(seq, phase, vbat_mV, yaw, pitch, roll, lat, lon, alt, temp, press
             return "nan"
         return format(v, fmt)
 
+    # XIAO側パーサのキーに合わせる（SEQ,PH,VBAT,Y,P,R,LAT,LON,ALT）
+    # 追加でT,Pr,Hも載せる（表示/保存用）
     s = (
         f"SEQ={seq},PH={phase},VBAT={vbat_mV},"
         f"Y={f(yaw,'.1f')},P={f(pitch,'.1f')},R={f(roll,'.1f')},"
@@ -110,8 +111,11 @@ def build_line(seq, phase, vbat_mV, yaw, pitch, roll, lat, lon, alt, temp, press
     return s.encode("ascii", errors="ignore")
 
 
+# =======================
+# One run (connect once, loop send)
+# =======================
 async def telemetry_once():
-    # --- I2C (CircuitPython) ---
+    # --- CircuitPython I2C stack ---
     i2c = busio.I2C(board.SCL, board.SDA)
     bno055 = adafruit_bno055.BNO055_I2C(i2c, address=BNO_ADDR)
     bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=BME_ADDR)
@@ -121,14 +125,13 @@ async def telemetry_once():
     buf = bytearray()
     latest = {"lat": None, "lon": None, "alt": None, "fixq": 0, "nsat": 0, "hdop": None}
 
-    # --- placeholders (後で実機値へ) ---
-    phase = 0
-    vbat_mV = 7400
+    # --- placeholders: 競技の実装に合わせて置換 ---
+    phase = 0          # TODO: Pi側のフェーズ管理値に置換
+    vbat_mV = 7400     # TODO: 電圧計測（外付けADC等）に置換
 
     seq = 0
     next_send = time.monotonic()
 
-    # BLE client（ここは finally で必ず切断を試みる）
     client = BleakClient(ADDR)
 
     with SMBus(BUS) as bus:
@@ -145,46 +148,61 @@ async def telemetry_once():
                     buf.extend(data)
                     buf = parse_nmea_from_buffer(buf, latest)
                 except OSError:
-                    pass  # GPSはエラー出ても継続
+                    pass
 
-                # -------- IMU/BME read (EIOは握る) --------
+                # -------- IMU read (EIO/Noneは握る) --------
                 yaw = pitch = roll = None
-                temp = press = hum = None
-
                 try:
                     euler = bno055.euler  # (heading, roll, pitch) or None
                     if euler is not None:
-                        if euler[0] is not None: yaw = float(euler[0])
-                        if euler[1] is not None: roll = float(euler[1])
-                        if euler[2] is not None: pitch = float(euler[2])
+                        if euler[0] is not None:
+                            yaw = float(euler[0])
+                        if euler[1] is not None:
+                            roll = float(euler[1])
+                        if euler[2] is not None:
+                            pitch = float(euler[2])
                 except OSError:
-                    pass  # BNO055のEIOも継続
+                    pass
 
+                # -------- BME read --------
+                temp = press = hum = None
                 try:
                     temp = float(bme280.temperature)
                     press = float(bme280.pressure)
                     hum = float(bme280.humidity)
                 except OSError:
-                    pass  # BMEのEIOも継続
+                    pass
                 except Exception:
                     pass
+
+                # -------- Prepare GPS fields --------
+                if latest["fixq"] > 0:
+                    lat = latest["lat"]
+                    lon = latest["lon"]
+                    alt = latest["alt"]
+                else:
+                    lat = lon = alt = None
 
                 # -------- Send at 10Hz --------
                 if now >= next_send:
                     next_send += SEND_DT
 
-                    lat = latest["lat"] if latest["fixq"] > 0 else None
-                    lon = latest["lon"] if latest["fixq"] > 0 else None
-                    alt = latest["alt"] if latest["fixq"] > 0 else None
-
                     payload = build_line(
-                        seq, phase, vbat_mV,
-                        yaw, pitch, roll,
-                        lat, lon, alt,
-                        temp, press, hum
+                        seq=seq,
+                        phase=phase,
+                        vbat_mV=vbat_mV,
+                        yaw=yaw,
+                        pitch=pitch,
+                        roll=roll,
+                        lat=lat,
+                        lon=lon,
+                        alt=alt,
+                        temp=temp,
+                        press=press,
+                        hum=hum,
                     )
 
-                    # まずは response=True でエラーを確実に拾う
+                    # デバッグ段階では response=True（成功/失敗が分かる）
                     await client.write_gatt_char(LOG_UUID, payload, response=True)
 
                     if seq % 20 == 0:
@@ -195,7 +213,7 @@ async def telemetry_once():
                 await asyncio.sleep(GPS_SLEEP)
 
         finally:
-            # ここが「already connected」対策の要：必ず切断を試みる
+            # 例外でも切断を試みる（already connected対策）
             try:
                 if client.is_connected:
                     await client.disconnect()
@@ -204,6 +222,9 @@ async def telemetry_once():
             print("Disconnected.")
 
 
+# =======================
+# Retry loop
+# =======================
 async def main():
     while True:
         try:
@@ -212,11 +233,9 @@ async def main():
             print("\nStopped by user.")
             return
         except BleakError as e:
-            # already connected など
             print("bleak error (retry):", repr(e))
             await asyncio.sleep(1.0)
         except OSError as e:
-            # ここに来るI/Oは「初期化中のEIO」等（再試行）
             print("error (retry):", repr(e))
             await asyncio.sleep(1.0)
         except Exception as e:
