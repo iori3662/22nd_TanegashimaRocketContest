@@ -1,327 +1,236 @@
-import time
-import math
-import threading
-
+import time, math, threading
 from smbus2 import SMBus
 import pynmea2
-
-import board
-import busio
+import board, busio
 import adafruit_bno055
-
 import pigpio
 
-# ============================================================
-# ユーザ設定
-# ============================================================
-GOAL_LAT = 35.00000000
-GOAL_LON = 139.00000000
+# ========= 目的地（あなた指定） =========
+GOAL_LAT = 35.66059
+GOAL_LON = 139.36688
 
-# フローチャート記載
-ARRIVAL_RADIUS_M = 5.0      # 「目的座標との距離が5m以内か」
-ANGLE_OK_DEG = 5.0          # 「|θ2-θ1| < 5」
+# ========= フローチャート閾値 =========
+ARRIVAL_RADIUS_M = 5.0   # 距離5m以内
+ANGLE_OK_DEG = 5.0       # |θ2-θ1|<5deg
 
-CONTROL_HZ = 5.0            # 分岐ベースなので低めでもOK（必要なら上げる）
-GPS_MIN_FIXQ = 1
-GPS_MIN_SATS = 5
-GPS_MAX_HDOP = 5.0
-GPS_STALE_SEC = 2.5
-
-# pigpio サーボ設定（あなたの値）
-SERVO1_PIN = 18
-SERVO2_PIN = 12
-SERVO1_STOP_US = 1480
-SERVO2_STOP_US = 1490
-SERVO_US_MIN = 1000
-SERVO_US_MAX = 2000
-SERVO_SCALE_US = 500  # cmd=±1で±500us
-
-# 行動の時間（フローチャートは「右折/左折/前進」なので時間で実装）
-TURN_SEC = 0.35        # 旋回させる時間
-FWD_SEC  = 0.50        # 前進させる時間
-FWD_CMD  = 0.60        # 前進強さ(0..1)
-TURN_CMD = 0.55        # 旋回強さ(0..1) ※場で調整
-
-# GPS I2C
+# ========= 制御・フィルタ =========
+CONTROL_HZ = 10.0
 GPS_BUS = 1
 GPS_ADDR = 0x42
+GPS_MIN_FIXQ = 1
+GPS_MIN_SATS = 5
+GPS_MAX_HDOP = 8.0       # 厳しければ緩める
+GPS_STALE_SEC = 2.5
 
-# ============================================================
-# ユーティリティ
-# ============================================================
+# ========= pigpio / サーボ =========
+PIN18 = 18
+PIN12 = 12
+STOP_US = 1490
+US_MIN = 500
+US_MAX = 2500
+
+SCALE_US = 500           # v,w=1で±500us（要調整）
+BASE_V = 0.70            # 前進(0..1)
+MIN_V  = 0.35
+SLOWDOWN_DIST_M = 8.0
+
+KP = 0.020               # [1/deg] 蛇行なら下げる（0.012など）
+W_MAX = 0.60
+
+# 直進が「少し左に曲がる」→右旋回バイアス（+）
+W_BIAS = +0.06           # まず+0.06、現場で微調整
+
+# ========= util =========
 def clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
-def wrap_to_180(angle_deg: float) -> float:
-    while angle_deg > 180.0:
-        angle_deg -= 360.0
-    while angle_deg < -180.0:
-        angle_deg += 360.0
-    return angle_deg
+def wrap_to_180(a):
+    while a > 180: a -= 360
+    while a < -180: a += 360
+    return a
 
-def haversine_m(lat1, lon1, lat2, lon2) -> float:
+def haversine_m(lat1, lon1, lat2, lon2):
     R = 6371000.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlmb = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlmb/2)**2
-    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
-    return R * c
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2-lat1)
+    dl = math.radians(lon2-lon1)
+    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2*R*math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-def bearing_deg(lat1, lon1, lat2, lon2) -> float:
+def bearing_deg(lat1, lon1, lat2, lon2):
     # 北=0 東=90（時計回り）0..360
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dlmb = math.radians(lon2 - lon1)
-    y = math.sin(dlmb) * math.cos(phi2)
-    x = math.cos(phi1)*math.sin(phi2) - math.sin(phi1)*math.cos(phi2)*math.cos(dlmb)
-    brng = math.degrees(math.atan2(y, x))
-    return (brng + 360.0) % 360.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2-lon1)
+    y = math.sin(dl)*math.cos(p2)
+    x = math.cos(p1)*math.sin(p2) - math.sin(p1)*math.cos(p2)*math.cos(dl)
+    b = math.degrees(math.atan2(y, x))
+    return (b + 360) % 360
 
 def dm_to_deg(dm, direction):
-    if dm is None or direction not in ("N", "S", "E", "W"):
+    if dm is None or direction not in ("N","S","E","W"):
         return None
     try:
         dm = float(dm)
     except ValueError:
         return None
     deg = int(dm // 100)
-    minutes = dm - deg * 100
-    val = deg + minutes / 60.0
-    return -val if direction in ("S", "W") else val
+    minutes = dm - deg*100
+    val = deg + minutes/60.0
+    return -val if direction in ("S","W") else val
 
-# ============================================================
-# GPS共有状態
-# ============================================================
-gps_latest = {
-    "lat": None, "lon": None, "alt": None,
-    "fixq": 0, "nsat": 0, "hdop": None,
-    "updated_monotonic": None,
-}
-gps_lock = threading.Lock()
+# ========= GPS shared =========
+gps = {"lat":None,"lon":None,"fixq":0,"nsat":0,"hdop":None,"t":None}
+lock = threading.Lock()
 
-def gps_reader_thread(stop_event: threading.Event):
+def gps_thread(stop_event):
     buf = bytearray()
     with SMBus(GPS_BUS) as bus:
         while not stop_event.is_set():
             try:
                 data = bus.read_i2c_block_data(GPS_ADDR, 0xFF, 32)
             except OSError:
-                time.sleep(0.05)
-                continue
+                time.sleep(0.05); continue
 
             buf.extend(data)
 
             while b'\n' in buf:
                 line, _, rest = buf.partition(b'\n')
                 buf = bytearray(rest)
-
                 s = line.decode("ascii", errors="ignore").strip()
                 if not s.startswith("$"):
                     continue
-
                 try:
                     msg = pynmea2.parse(s)
                 except pynmea2.ParseError:
                     continue
 
                 if msg.sentence_type == "RMC" and getattr(msg, "status", "") == "A":
-                    lat = dm_to_deg(getattr(msg, "lat", None), getattr(msg, "lat_dir", None))
-                    lon = dm_to_deg(getattr(msg, "lon", None), getattr(msg, "lon_dir", None))
+                    lat = dm_to_deg(getattr(msg,"lat",None), getattr(msg,"lat_dir",None))
+                    lon = dm_to_deg(getattr(msg,"lon",None), getattr(msg,"lon_dir",None))
                     if lat is not None and lon is not None:
-                        with gps_lock:
-                            gps_latest["lat"] = lat
-                            gps_latest["lon"] = lon
-                            gps_latest["updated_monotonic"] = time.monotonic()
+                        with lock:
+                            gps["lat"]=lat; gps["lon"]=lon; gps["t"]=time.monotonic()
 
                 elif msg.sentence_type == "GGA":
-                    try:
-                        fixq = int(getattr(msg, "gps_qual", 0) or 0)
-                    except ValueError:
-                        fixq = 0
-                    try:
-                        nsat = int(getattr(msg, "num_sats", 0) or 0)
-                    except ValueError:
-                        nsat = 0
-                    try:
-                        hdop = float(getattr(msg, "horizontal_dil", 0) or 0)
-                    except ValueError:
-                        hdop = None
-
-                    alt = None
-                    if fixq > 0:
-                        try:
-                            alt = float(getattr(msg, "altitude", 0) or 0)
-                        except ValueError:
-                            alt = None
-
-                    with gps_lock:
-                        gps_latest["fixq"] = fixq
-                        gps_latest["nsat"] = nsat
-                        gps_latest["hdop"] = hdop
-                        if alt is not None:
-                            gps_latest["alt"] = alt
+                    try: fixq=int(getattr(msg,"gps_qual",0) or 0)
+                    except ValueError: fixq=0
+                    try: nsat=int(getattr(msg,"num_sats",0) or 0)
+                    except ValueError: nsat=0
+                    try: hdop=float(getattr(msg,"horizontal_dil",0) or 0)
+                    except ValueError: hdop=None
+                    with lock:
+                        gps["fixq"]=fixq; gps["nsat"]=nsat; gps["hdop"]=hdop
 
             time.sleep(0.02)
 
-# ============================================================
-# サーボ（差動）
-# ============================================================
-class DifferentialServoPigpio:
+# ========= Drive =========
+class Drive:
     def __init__(self, pi):
         self.pi = pi
         self.stop()
 
-    def _cmd_to_us(self, cmd, stop_us):
-        cmd = clamp(cmd, -1.0, 1.0)
-        us = int(round(stop_us + cmd * SERVO_SCALE_US))
-        return int(clamp(us, SERVO_US_MIN, SERVO_US_MAX))
-
-    def set(self, left_cmd, right_cmd):
-        usL = self._cmd_to_us(left_cmd, SERVO1_STOP_US)
-        usR = self._cmd_to_us(right_cmd, SERVO2_STOP_US)
-        self.pi.set_servo_pulsewidth(SERVO1_PIN, usL)
-        self.pi.set_servo_pulsewidth(SERVO2_PIN, usR)
+    def _write(self, us18, us12):
+        self.pi.set_servo_pulsewidth(PIN18, int(clamp(us18, US_MIN, US_MAX)))
+        self.pi.set_servo_pulsewidth(PIN12, int(clamp(us12, US_MIN, US_MAX)))
 
     def stop(self):
-        self.pi.set_servo_pulsewidth(SERVO1_PIN, SERVO1_STOP_US)
-        self.pi.set_servo_pulsewidth(SERVO2_PIN, SERVO2_STOP_US)
+        self._write(STOP_US, STOP_US)
 
     def free(self):
-        self.pi.set_servo_pulsewidth(SERVO1_PIN, 0)
-        self.pi.set_servo_pulsewidth(SERVO2_PIN, 0)
+        self.pi.set_servo_pulsewidth(PIN18, 0)
+        self.pi.set_servo_pulsewidth(PIN12, 0)
 
-# 行動プリミティブ（フローチャートの「右折/左折/前進」）
-def do_forward(servo: DifferentialServoPigpio, sec: float):
-    servo.set(FWD_CMD, FWD_CMD)
-    time.sleep(sec)
-    servo.stop()
+    def set_vw(self, v, w):
+        """
+        v: 前進 0..1
+        w: 右旋回 +、左旋回 -
+        実測より:
+          前進 = (PIN18↓, PIN12↑)
+          右旋回 = (PIN18↑, PIN12↑)
+          左旋回 = (PIN18↓, PIN12↓)
+        """
+        v = clamp(v, 0.0, 1.0)
+        w = clamp(w, -1.0, 1.0)
 
-def do_turn_right(servo: DifferentialServoPigpio, sec: float):
-    # 右折：左を前、右を後（その場旋回）
-    servo.set(+TURN_CMD, -TURN_CMD)
-    time.sleep(sec)
-    servo.stop()
+        us18 = STOP_US - v*SCALE_US + w*SCALE_US
+        us12 = STOP_US + v*SCALE_US + w*SCALE_US
+        self._write(us18, us12)
 
-def do_turn_left(servo: DifferentialServoPigpio, sec: float):
-    # 左折：左を後、右を前（その場旋回）
-    servo.set(-TURN_CMD, +TURN_CMD)
-    time.sleep(sec)
-    servo.stop()
-
-# ============================================================
-# メイン：GPS誘導フェーズ（フローチャート準拠）
-# ============================================================
+# ========= main =========
 def main():
-    # pigpio
     pi = pigpio.pi()
     if not pi.connected:
-        raise RuntimeError("pigpio not connected. pigpiod が起動しているか確認してください。")
-    servo = DifferentialServoPigpio(pi)
+        raise RuntimeError("pigpio not connected. pigpiod起動を確認してください。")
+    drv = Drive(pi)
 
-    # BNO055
     i2c = busio.I2C(board.SCL, board.SDA)
-    sensor = adafruit_bno055.BNO055_I2C(i2c, address=0x28)
+    bno = adafruit_bno055.BNO055_I2C(i2c, address=0x28)
 
-    # GPS thread start
     stop_event = threading.Event()
-    th = threading.Thread(target=gps_reader_thread, args=(stop_event,), daemon=True)
-    th.start()
+    threading.Thread(target=gps_thread, args=(stop_event,), daemon=True).start()
 
-    print("=== GPS誘導フェーズ start ===")
-    print(f"Goal lat={GOAL_LAT}, lon={GOAL_LON}")
-    print("※根拠：提示フローチャート（距離5m/角度差5degの分岐）")
+    dt = 1.0/CONTROL_HZ
+    last = time.monotonic()
 
-    dt = 1.0 / CONTROL_HZ
-    last_log = time.monotonic()
+    print("=== GPS誘導フェーズ（5m/5deg判定） ===")
+    print(f"Goal: {GOAL_LAT}, {GOAL_LON}")
 
     try:
         while True:
             t0 = time.monotonic()
 
-            # ---- GPS取得（フローチャート：GPSから座標を取得）----
-            with gps_lock:
-                lat = gps_latest["lat"]
-                lon = gps_latest["lon"]
-                fixq = gps_latest["fixq"]
-                nsat = gps_latest["nsat"]
-                hdop = gps_latest["hdop"]
-                upd = gps_latest["updated_monotonic"]
+            with lock:
+                lat=gps["lat"]; lon=gps["lon"]; fixq=gps["fixq"]; nsat=gps["nsat"]; hdop=gps["hdop"]; tg=gps["t"]
 
-            gps_ok = (
-                (lat is not None) and (lon is not None) and
-                (fixq >= GPS_MIN_FIXQ) and
-                (nsat >= GPS_MIN_SATS) and
-                (hdop is not None) and (hdop <= GPS_MAX_HDOP) and
-                (upd is not None) and ((time.monotonic() - upd) < GPS_STALE_SEC)
-            )
+            gps_ok = (lat is not None and lon is not None and fixq>=GPS_MIN_FIXQ and nsat>=GPS_MIN_SATS and
+                      hdop is not None and hdop<=GPS_MAX_HDOP and tg is not None and (time.monotonic()-tg)<GPS_STALE_SEC)
 
-            # ---- 方位取得（フローチャート：機体の方位角θ2）----
-            heading = sensor.euler[0]  # 北0東90
-            if heading is None:
-                servo.stop()
+            heading = bno.euler[0]  # 北0東90
+            if heading is None or not gps_ok:
+                drv.stop()
                 time.sleep(dt)
                 continue
 
-            if not gps_ok:
-                servo.stop()
-                if time.monotonic() - last_log > 1.0:
-                    print(f"[WAIT] GPS未準備 fixq={fixq} nsat={nsat} hdop={hdop} heading={heading:.1f}")
-                    last_log = time.monotonic()
-                time.sleep(max(0.0, dt - (time.monotonic() - t0)))
-                continue
-
-            # ---- 距離算出（フローチャート：目的座標との距離を算出）----
             dist = haversine_m(lat, lon, GOAL_LAT, GOAL_LON)
-
-            # ---- 分岐：距離が5m以内か ----
             if dist <= ARRIVAL_RADIUS_M:
-                servo.stop()
-                print(f"[DONE] dist={dist:.2f}m <= {ARRIVAL_RADIUS_M}m → 次フェーズへ（ここで停止）")
+                drv.stop()
+                print(f"[ARRIVED] dist={dist:.2f}m <= {ARRIVAL_RADIUS_M}m")
                 break
 
-            # ---- 目標方位角θ1（フローチャート：目標座標の方位角θ1）----
-            theta1 = bearing_deg(lat, lon, GOAL_LAT, GOAL_LON)   # 0..360
-            theta2 = heading                                    # 0..360想定
+            theta1 = bearing_deg(lat, lon, GOAL_LAT, GOAL_LON)  # 0..360
+            theta2 = heading
+            # 目標-機体（右なら正）
+            err = wrap_to_180(theta1 - theta2)
 
-            # フローチャートの |θ2-θ1| 判定は、0/360跨ぎを考えるとwrapが必要
-            err = wrap_to_180(theta2 - theta1)  # θ2-θ1 を -180..180 へ
-            err_abs = abs(err)
-
-            # ---- 分岐：|θ2-θ1| < 5 ----
-            if err_abs < ANGLE_OK_DEG:
-                # 前進
-                do_forward(servo, FWD_SEC)
+            # 減速
+            if dist < SLOWDOWN_DIST_M:
+                a = clamp(dist/SLOWDOWN_DIST_M, 0.0, 1.0)
+                v = MIN_V + (BASE_V - MIN_V)*a
             else:
-                # ---- 以下：フローチャートの「θ2>θ1」「差が180未満」分岐に相当 ----
-                # 図の右側分岐に誤記の可能性があるので、最短回転方向で安全に決める
-                # err = θ2-θ1:
-                #   err > 0 → 機体が目標より右に向き過ぎ → 左へ戻す（左折）
-                #   err < 0 → 機体が目標より左に向き過ぎ → 右へ戻す（右折）
-                if err > 0:
-                    do_turn_left(servo, TURN_SEC)
-                else:
-                    do_turn_right(servo, TURN_SEC)
+                v = BASE_V
 
-                # 旋回の後に前進（フローチャート：右折/左折 → 前進）
-                do_forward(servo, FWD_SEC)
+            # フローチャート条件を反映
+            if abs(err) < ANGLE_OK_DEG:
+                w = W_BIAS
+            else:
+                w = clamp(KP*err + W_BIAS, -W_MAX, W_MAX)
 
-            if time.monotonic() - last_log > 1.0:
-                # 監視用ログ
-                print(f"[GPS] dist={dist:6.1f}m θ1={theta1:6.1f} θ2={theta2:6.1f} (θ2-θ1)={err:6.1f} "
-                      f"nsat={nsat} hdop={hdop}")
-                last_log = time.monotonic()
+            drv.set_vw(v, w)
 
-            time.sleep(max(0.0, dt - (time.monotonic() - t0)))
+            if time.monotonic()-last > 1.0:
+                print(f"[CTRL] dist={dist:6.1f}m θ1={theta1:6.1f} θ2={theta2:6.1f} err={err:6.1f} "
+                      f"v={v:.2f} w={w:.2f} nsat={nsat} hdop={hdop}")
+                last = time.monotonic()
+
+            time.sleep(max(0.0, dt-(time.monotonic()-t0)))
 
     except KeyboardInterrupt:
-        print("Ctrl-C: stop")
+        print("Ctrl-C")
     finally:
-        servo.stop()
+        drv.stop()
         stop_event.set()
         time.sleep(0.2)
-        servo.free()
+        drv.free()
         pi.stop()
         print("Finish")
 
