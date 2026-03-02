@@ -1,38 +1,64 @@
-import time, math
+import time
+import math
 from collections import deque
 import statistics
 
-DT = 0.10  # 10Hz
+import board
+import busio
+import adafruit_bno055
+from adafruit_bme280 import basic as adafruit_bme280
 
-# median window
-WIN = 11               # 奇数推奨（中央値が安定）
-REQ_CONSEC = 5         # 5回連続
+# =========================
+# 設定
+# =========================
+DT = 0.10            # 10Hz
+WIN = 11             # 中央値窓（奇数推奨）
+REQ = 5              # 5回連続
 
-# thresholds (要現地チューニング)
-ACC_MIN, ACC_MAX = 6.0, 13.0     # |a| が1g付近
-VZ_ABS_TH = 0.10                 # |vz| がほぼ0（停止）
-GYRO_ABS_TH = 0.25               # 任意：停止時の回転の小ささ
+FREEFALL_ACC_TH = 3.0   # |a| < 3.0 m/s^2 -> 自由落下候補（要調整）
+LAND_VZ_ABS_TH = 0.15   # |vz| < 0.15 m/s -> ほぼ停止（要調整）
 
-# buffers
-buf_acc = deque(maxlen=WIN)
-buf_vz  = deque(maxlen=WIN)
-buf_gyro= deque(maxlen=WIN)
+SEA_LEVEL_HPA = 1013.25 # 現地で合わせると安定（要調整）
 
-land_consec = 0
+# =========================
+# センサ初期化
+# =========================
+i2c = busio.I2C(board.SCL, board.SDA)
+bno055 = adafruit_bno055.BNO055_I2C(i2c, address=0x28)
+bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=0x76)
+bme280.sea_level_pressure = SEA_LEVEL_HPA
 
+# =========================
+# ユーティリティ
+# =========================
 def norm3(v):
     if v is None:
         return None
-    return math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
+    x, y, z = v
+    return math.sqrt(x*x + y*y + z*z)
 
 def median_or_none(buf):
     if len(buf) < buf.maxlen:
         return None
     return statistics.median(buf)
 
-# ループ内（例）
+# =========================
+# バッファ
+# =========================
+buf_acc = deque(maxlen=WIN)
+buf_vz  = deque(maxlen=WIN)
+
+# =========================
+# ループ
+# =========================
 prev_alt = bme280.altitude
 prev_t = time.time()
+
+freefall_confirmed = False
+freefall_consec = 0
+land_consec = 0
+
+print("Start: detecting FREEFALL -> LANDING ...")
 
 while True:
     now = time.time()
@@ -41,47 +67,56 @@ while True:
         dt = DT
     prev_t = now
 
+    # read sensors
     alt = bme280.altitude
     accN = norm3(bno055.acceleration)
-    gyroN = norm3(bno055.gyro)
 
+    # vertical speed (simple diff)
     vz = (alt - prev_alt) / dt
     prev_alt = alt
 
-    # バッファに積む（Noneは捨てる）
-    if accN is not None:  buf_acc.append(accN)
-    if gyroN is not None: buf_gyro.append(gyroN)
-    buf_vz.append(vz)  # vzは計算できるので入れる
+    # push to buffers (ignore None for acc)
+    if accN is not None:
+        buf_acc.append(accN)
+    buf_vz.append(vz)
 
-    # 中央値を作る（窓が埋まるまでNone）
-    acc_med  = median_or_none(buf_acc)
-    vz_med   = median_or_none(buf_vz)
-    gyro_med = median_or_none(buf_gyro)  # gyroが取れない環境なら判定から外す設計も可
+    # compute medians
+    acc_med = median_or_none(buf_acc)
+    vz_med  = median_or_none(buf_vz)
 
+    # wait until window filled
     if acc_med is None or vz_med is None:
         time.sleep(DT)
         continue
 
-    # 着地条件（中央値ベース）
-    acc_ok = (ACC_MIN <= acc_med <= ACC_MAX)
-    vz_ok  = (abs(vz_med) <= VZ_ABS_TH)
+    # ---- FREEFALL detection (median x 5) ----
+    if not freefall_confirmed:
+        if acc_med < FREEFALL_ACC_TH:
+            freefall_consec += 1
+        else:
+            freefall_consec = 0
 
-    # gyroは「あるなら使う」方式（安全側に倒すなら gyro_med is None をNGに）
-    gyro_ok = (gyro_med is None) or (gyro_med <= GYRO_ABS_TH)
+        print(f"[FREEFALL?] alt={alt:.2f} acc_med={acc_med:.2f} vz_med={vz_med:.2f} consec={freefall_consec}")
 
-    if acc_ok and vz_ok and gyro_ok:
-        land_consec += 1
+        if freefall_consec >= REQ:
+            freefall_confirmed = True
+            print("FREEFALL CONFIRMED")
+            # reset landing counter for safety
+            land_consec = 0
+
+    # ---- LANDING detection (only after freefall) ----
     else:
-        land_consec = 0
+        if abs(vz_med) < LAND_VZ_ABS_TH:
+            land_consec += 1
+        else:
+            land_consec = 0
 
-    print(f"acc_med={acc_med:.2f} vz_med={vz_med:.2f} gyro_med={gyro_med if gyro_med is None else round(gyro_med,2)} consec={land_consec}")
+        print(f"[LAND?] alt={alt:.2f} acc_med={acc_med:.2f} vz_med={vz_med:.2f} consec={land_consec}")
 
-    if land_consec >= REQ_CONSEC:
-        print("LANDED CONFIRMED (median x 5)")
-        # -> ここで pin11 HIGH（タイマで必ずOFF）
-        GPIO.output(11, GPIO.HIGH)
-        time.sleep(2.0)
-        GPIO.output(11, GPIO.LOW)
-        break
+        if land_consec >= REQ:
+            print("LANDING CONFIRMED")
+            break
 
     time.sleep(DT)
+
+print("Done.")
