@@ -63,6 +63,7 @@ def set_diff_drive(pi, fwd, turn):
     pin18: 小さいほど前進 → STOP - value
     pin12: 大きいほど前進 → STOP + value
     """
+    turn = -turn
 
     left_power  = fwd + turn
     right_power = fwd - turn
@@ -105,7 +106,7 @@ def main():
         raise RuntimeError("pigpio未起動。sudo pigpiod を実行してください。")
 
     # -------- カメラ設定 --------
-    W, H = 640, 480
+    W, H = 480, 640
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(
         main={"format": "BGR888", "size": (W, H)}
@@ -178,6 +179,7 @@ def main():
                         status = "TURN"
 
             # ---- 表示 ----
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             cv2.line(frame, (cx_frame, 0), (cx_frame, H2), (255, 255, 255), 1)
 
             if best_approx is not None:
