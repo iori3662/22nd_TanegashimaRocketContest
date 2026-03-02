@@ -10,8 +10,8 @@ GOAL_LAT = 35.66059
 GOAL_LON = 139.36688
 
 # ========= フローチャート閾値 =========
-ARRIVAL_RADIUS_M = 5.0   # 距離5m以内
-ANGLE_OK_DEG = 5.0       # |θ2-θ1|<5deg
+ARRIVAL_RADIUS_M = 1.0   # 距離5m以内
+ANGLE_OK_DEG = 3.0       # |θ2-θ1|<5deg
 
 # ========= 制御・フィルタ =========
 CONTROL_HZ = 10.0
@@ -23,8 +23,8 @@ GPS_MAX_HDOP = 8.0       # 厳しければ緩める
 GPS_STALE_SEC = 2.5
 
 # ========= pigpio / サーボ =========
-PIN18 = 18
-PIN12 = 12
+PIN18 = 18 #右
+PIN12 = 12 #左
 STOP_US = 1490
 US_MIN = 500
 US_MAX = 2500
@@ -34,7 +34,7 @@ BASE_V = 0.70            # 前進(0..1)
 MIN_V  = 0.35
 SLOWDOWN_DIST_M = 8.0
 
-KP = 0.020               # [1/deg] 蛇行なら下げる（0.012など）
+KP = 0.1               # [1/deg] 蛇行なら下げる（0.012など）
 W_MAX = 0.60
 
 # 直進が「少し左に曲がる」→右旋回バイアス（+）
@@ -44,12 +44,12 @@ W_BIAS = +0.06           # まず+0.06、現場で微調整
 def clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
-def wrap_to_180(a):
+def wrap_to_180(a): #角度差を -180°～+180° に正規化
     while a > 180: a -= 360
     while a < -180: a += 360
     return a
 
-def haversine_m(lat1, lon1, lat2, lon2):
+def haversine_m(lat1, lon1, lat2, lon2): #2点間の地表距離[m]を計算
     R = 6371000.0
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp = math.radians(lat2-lat1)
@@ -57,7 +57,7 @@ def haversine_m(lat1, lon1, lat2, lon2):
     a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
     return 2*R*math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-def bearing_deg(lat1, lon1, lat2, lon2):
+def bearing_deg(lat1, lon1, lat2, lon2): #角度誤差の計算
     # 北=0 東=90（時計回り）0..360
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dl = math.radians(lon2-lon1)
