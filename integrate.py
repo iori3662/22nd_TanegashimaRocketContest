@@ -218,7 +218,7 @@ class FallConfig:
     sea_level_hpa: float = 1013.25
 
     # ---- FREEFALL (OR条件) ----
-    freefall_acc_th: float = 3.0
+    freefall_acc_th: float = 8.5
     freefall_dalt_th: float = -0.10   # 0.1sで-0.10m → -1m/s相当（10Hz前提）
 
     # ---- LANDING (OR条件) ----
@@ -745,7 +745,7 @@ def main():
     fall_cfg = FallConfig(
         dt=0.10,
         win=11,
-        req=5,
+        req=3,
         sea_level_hpa=1013.25,
     )
 

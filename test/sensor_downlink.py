@@ -1,27 +1,58 @@
+#!/usr/bin/env python3
+"""
+CanSat sensor downlink using TWELITE via pigpio "soft UART".
+
+- Hardware UART (/dev/serial0) is NOT used.
+- TX/RX are done on GPIOs with pigpio:
+  - RX (bit-bang read): bb_serial_read_open()
+  - TX (DMA wave):      wave_add_serial() + wave_send_once()
+
+Your wiring-mistake case is supported:
+  Twelite TX -> Pi GPIO14  (use as RX_INPUT)
+  Twelite RX -> Pi GPIO15  (use as TX_OUTPUT)
+
+Requirements:
+  - pigpiod running: sudo systemctl enable --now pigpiod
+  - pip install pigpio adafruit-circuitpython-bno055 adafruit-circuitpython-bme280 smbus2 pynmea2
+"""
+
 import time
 import sys
-import serial
+
+import pigpio
 
 import board
-import busio
 import adafruit_bno055
 from adafruit_bme280 import basic as adafruit_bme280
 
 from smbus2 import SMBus
 import pynmea2
 
+
 # ==========================================
 # 設定
 # ==========================================
-TWELITE_PORT = "/dev/serial0"
-TWELITE_BAUD = 38400
 
+# --- TWELITE soft UART GPIO (wiring-mistake friendly) ---
+TWELITE_RX_GPIO = 14   # Pi input  (connected to TWELITE_TX)
+TWELITE_TX_GPIO = 15   # Pi output (connected to TWELITE_RX)
+
+TWELITE_BAUD = 38400
+TWELITE_DATA_BITS = 8
+TWELITE_STOP_HALF_BITS = 2  # pigpio: bb_stop is "stop half bits" (2 => 1 stop bit)
+
+# --- GNSS (I2C) ---
 GPS_I2C_BUS = 1
 GPS_I2C_ADDR = 0x42  # SAM-M8Q など
 GPS_READ_LEN = 32    # 1回で読むバイト数
 
+# --- Loop rates ---
 SEND_HZ = 1.0        # TWELITEへ送信周期 [Hz]
 LOOP_HZ = 20.0       # メインループ周期 [Hz]
+
+# --- Soft UART behavior ---
+TX_LINE_ENDING = b"\r\n"   # TWELITE側設定に合わせる（CRLFが無難）
+RX_BUF_MAX = 4096          # 受信バッファ肥大防止
 
 
 # ==========================================
@@ -45,17 +76,106 @@ def dm_to_deg(dm, direction):
 
 
 # ==========================================
+# Soft UART for TWELITE (pigpio)
+# ==========================================
+class TweliteSoftUART:
+    """
+    pigpio-based soft UART:
+      - TX: wave_add_serial (DMA)
+      - RX: bb_serial_read (bit-bang)
+    """
+
+    def __init__(self, rx_gpio: int, tx_gpio: int, baud: int):
+        self.rx_gpio = rx_gpio
+        self.tx_gpio = tx_gpio
+        self.baud = baud
+        self._rx_buf = bytearray()
+
+        self.pi = pigpio.pi()
+        if not self.pi.connected:
+            raise RuntimeError("pigpiodに接続できません。`sudo systemctl start pigpiod` を確認してください。")
+
+        # TX idle high
+        self.pi.set_mode(self.tx_gpio, pigpio.OUTPUT)
+        self.pi.write(self.tx_gpio, 1)
+
+        # RX open (bit-bang)
+        self.pi.set_mode(self.rx_gpio, pigpio.INPUT)
+        self.pi.bb_serial_read_open(self.rx_gpio, self.baud, TWELITE_DATA_BITS)
+        time.sleep(0.05)
+
+    def close(self):
+        try:
+            self.pi.bb_serial_read_close(self.rx_gpio)
+        except pigpio.error:
+            pass
+        try:
+            self.pi.stop()
+        except Exception:
+            pass
+
+    def write_line(self, line_str: str):
+        """
+        Send a line (ASCII) with line ending.
+        """
+        payload = line_str.encode("ascii", errors="ignore") + TX_LINE_ENDING
+
+        # TX via DMA wave (robust)
+        self.pi.wave_clear()
+        # pigpio 1.78 signature: wave_add_serial(gpio, baud, data, offset=0, bb_bits=8, bb_stop=2)
+        self.pi.wave_add_serial(self.tx_gpio, self.baud, payload, 0, TWELITE_DATA_BITS, TWELITE_STOP_HALF_BITS)
+        wid = self.pi.wave_create()
+        if wid < 0:
+            raise RuntimeError("wave_create failed")
+
+        self.pi.wave_send_once(wid)
+        while self.pi.wave_tx_busy():
+            time.sleep(0.001)
+        self.pi.wave_delete(wid)
+
+    def _read_bytes(self) -> bytes:
+        cnt, data = self.pi.bb_serial_read(self.rx_gpio)
+        if cnt > 0 and data:
+            # data is bytearray
+            return bytes(data)
+        return b""
+
+    def read_lines(self):
+        """
+        Non-blocking read of complete lines ending with '\n'.
+        Returns list[str].
+        """
+        chunk = self._read_bytes()
+        if chunk:
+            self._rx_buf.extend(chunk)
+            if len(self._rx_buf) > RX_BUF_MAX:
+                self._rx_buf = self._rx_buf[-RX_BUF_MAX:]
+
+        lines = []
+        while b"\n" in self._rx_buf:
+            raw, _, rest = self._rx_buf.partition(b"\n")
+            self._rx_buf = bytearray(rest)
+            raw = raw.rstrip(b"\r")
+            lines.append(raw.decode("ascii", errors="replace").strip())
+        return lines
+
+
+# ==========================================
 # メイン
 # ==========================================
 def main():
-    # ---------- TWELITE シリアル ----------
+    # ---------- TWELITE Soft UART ----------
     try:
-        ser = serial.Serial(TWELITE_PORT, TWELITE_BAUD, timeout=0)
+        tw = TweliteSoftUART(
+            rx_gpio=TWELITE_RX_GPIO,
+            tx_gpio=TWELITE_TX_GPIO,
+            baud=TWELITE_BAUD,
+        )
     except Exception as e:
-        print("TWELITEポートを開けません:", e)
+        print("TWELITE (soft UART) 初期化に失敗:", e)
         sys.exit(1)
 
-    print(f"TWELITEポート {TWELITE_PORT} をオープンしました")
+    print(f"TWELITE soft UART open: RX=GPIO{TWELITE_RX_GPIO}, TX=GPIO{TWELITE_TX_GPIO}, {TWELITE_BAUD}bps")
 
     # ---------- I2C (BNO055, BME280) ----------
     i2c = board.I2C()
@@ -147,10 +267,10 @@ def main():
                 next_send_time += 1.0 / SEND_HZ
 
                 # ----- BNO055 -----
-                euler = bno055.euler    # (heading, roll, pitch)
-                gyro = bno055.gyro      # (gx, gy, gz)
+                euler = bno055.euler         # (heading, roll, pitch)
+                gyro = bno055.gyro           # (gx, gy, gz)
                 accel = bno055.acceleration  # (ax, ay, az)
-                mag = bno055.magnetic   # (mx, my, mz)
+                mag = bno055.magnetic        # (mx, my, mz)
 
                 # None 対策: 取得できなければ 0.0 などに置き換え
                 def safe_vec3(v):
@@ -172,10 +292,10 @@ def main():
                 mx, my, mz = mag
 
                 # ----- BME280 -----
-                temp = bme280.temperature
-                press = bme280.pressure
-                humid = bme280.humidity
-                bme_alt = bme280.altitude
+                temp = float(bme280.temperature)
+                press = float(bme280.pressure)
+                humid = float(bme280.humidity)
+                bme_alt = float(bme280.altitude)
 
                 # ----- GNSS -----
                 lat = latest_gps["lat"]
@@ -209,9 +329,9 @@ def main():
                 )
 
                 try:
-                    ser.write((line + "\r\n").encode())
+                    tw.write_line(line)
                 except Exception as e:
-                    print("シリアル送信エラー:", e)
+                    print("TWELITE送信エラー:", e)
 
                 # デバッグ用に標準出力にも表示
                 print(line)
@@ -219,14 +339,13 @@ def main():
             # ==============================
             # 4) TWELITE からの受信（必要なら）
             # ==============================
+            # pyserialの in_waiting/ readline 相当を "行単位" で実装
             try:
-                if ser.in_waiting > 0:
-                    rx = ser.readline()
-                    if rx:
-                        text = rx.decode(errors="replace").rstrip()
+                for text in tw.read_lines():
+                    if text:
                         print(f"[RX] {text}")
             except Exception as e:
-                print("シリアル受信エラー:", e)
+                print("TWELITE受信エラー:", e)
 
             # ループ周期調整
             elapsed = time.monotonic() - loop_start
@@ -241,8 +360,8 @@ def main():
             gps_bus.close()
         except Exception:
             pass
-        ser.close()
-        print("ポートをクローズしました。")
+        tw.close()
+        print("soft UART をクローズしました。")
 
 
 if __name__ == "__main__":
