@@ -816,5 +816,5 @@ void loop(){
   }
 
   // Give time to BLE task (important)
-  delay(5);
+  delay(10);
 }

@@ -504,7 +504,7 @@ async def ble_loop_fixed(shared: SharedState, latest_in: dict, stop_evt: asyncio
             for line in s.splitlines():
                 handle_cmd(shared, line)
 
-    backoff = 0.5  # seconds
+    backoff = 0.5
     BACKOFF_MAX = 8.0
 
     while not stop_evt.is_set():
@@ -517,68 +517,63 @@ async def ble_loop_fixed(shared: SharedState, latest_in: dict, stop_evt: asyncio
         print(f"[BLE] found {XIAO_NAME} addr={addr}")
 
         try:
-            client = BleakClient(addr)
+            # bleak互換：async with でOK（あなたの環境で動いていた方式）
+            async with BleakClient(addr) as client:
+                print("[BLE] connected")
 
-            def _dc(_):
-                print("[BLE] disconnected callback")
+                # notify購読（XIAO->Pi コマンド）
+                await client.start_notify(UART_TX_UUID, on_notify)
+                print("[BLE] notify started")
 
-            client.set_disconnected_callback(_dc)
+                # ★重要：接続直後の周辺が忙しい瞬間を避ける
+                await asyncio.sleep(1.0)
 
-            await client.connect()
-            print("[BLE] connected")
+                # ここは不要（XIAOはヘッダ無視。余計なwriteを減らして安定化）
+                # await client.write_gatt_char(UART_RX_UUID, (CSV_HEADER + "\n").encode("utf-8"), response=False)
 
-            await client.start_notify(UART_TX_UUID, on_notify)
-            print("[BLE] notify started")
+                next_tick = time.monotonic()
+                dt = 1.0 / TELEM_HZ
 
-            # ★重要：接続直後は周辺が不安定になりやすいので待つ
-            await asyncio.sleep(1.0)
+                # 成功したのでバックオフリセット
+                backoff = 0.5
 
-            # ヘッダは基本不要（XIAOは無視する＆write負荷を減らす）
-            # await client.write_gatt_char(UART_RX_UUID, (CSV_HEADER + "\n").encode("utf-8"), response=False)
+                while client.is_connected and (not stop_evt.is_set()):
+                    now = time.monotonic()
+                    if now >= next_tick:
+                        next_tick += dt
 
-            # tick loop
-            next_tick = time.monotonic()
-            dt = 1.0 / TELEM_HZ
+                        line = build_csv_line(shared, latest_in)
 
-            backoff = 0.5  # reset backoff after successful session
+                        # Piローカルログ（提出用）
+                        if shared.logging:
+                            pi_log.write(line + "\n")
 
-            while client.is_connected and (not stop_evt.is_set()):
-                now = time.monotonic()
-                if now >= next_tick:
-                    next_tick += dt
+                        # Pi -> XIAO
+                        try:
+                            await client.write_gatt_char(
+                                UART_RX_UUID,
+                                (line + "\n").encode("utf-8"),
+                                response=False
+                            )
+                        except (BleakError, OSError) as e:
+                            print(f"[BLE] write error: {e}")
+                            break
 
-                    line = build_csv_line(shared, latest_in)
+                    # BLE/DBusにCPUを渡す
+                    await asyncio.sleep(0.001)
 
-                    if shared.logging:
-                        pi_log.write(line + "\n")
+                print("[BLE] disconnected (inner loop end)")
 
-                    try:
-                        await client.write_gatt_char(
-                            UART_RX_UUID,
-                            (line + "\n").encode("utf-8"),
-                            response=False
-                        )
-                    except (BleakError, OSError) as e:
-                        print(f"[BLE] write error: {e}")
-                        break
-
-                await asyncio.sleep(0.001)
-
-            print("[BLE] disconnected (inner loop end)")
-
-            try:
-                await client.stop_notify(UART_TX_UUID)
-            except Exception:
-                pass
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+                # notify停止（例外は握りつぶして再接続へ）
+                try:
+                    await client.stop_notify(UART_TX_UUID)
+                except Exception:
+                    pass
 
         except Exception as e:
             print(f"[BLE] connect/session error: {e}")
 
-        # ★重要：指数バックオフ（本番での“揺らぎ”を吸収）
+        # 切断が続くときに暴れないよう指数バックオフ
         await asyncio.sleep(backoff)
         backoff = min(BACKOFF_MAX, backoff * 2)
 
