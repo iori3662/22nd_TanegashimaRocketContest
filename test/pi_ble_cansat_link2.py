@@ -504,6 +504,9 @@ async def ble_loop_fixed(shared: SharedState, latest_in: dict, stop_evt: asyncio
             for line in s.splitlines():
                 handle_cmd(shared, line)
 
+    backoff = 0.5  # seconds
+    BACKOFF_MAX = 8.0
+
     while not stop_evt.is_set():
         addr = await find_xiao_addr()
         if not addr:
@@ -512,48 +515,72 @@ async def ble_loop_fixed(shared: SharedState, latest_in: dict, stop_evt: asyncio
             continue
 
         print(f"[BLE] found {XIAO_NAME} addr={addr}")
+
         try:
-            async with BleakClient(addr) as client:
-                print("[BLE] connected")
+            client = BleakClient(addr)
 
-                await client.start_notify(UART_TX_UUID, on_notify)
-                print("[BLE] notify started")
+            def _dc(_):
+                print("[BLE] disconnected callback")
 
-                # optional header
-                try:
-                    await client.write_gatt_char(UART_RX_UUID, (CSV_HEADER + "\n").encode("utf-8"), response=False)
-                except Exception:
-                    pass
+            client.set_disconnected_callback(_dc)
 
-                next_tick = time.monotonic()
-                dt = 1.0 / TELEM_HZ  # telemetry/log tick unified
+            await client.connect()
+            print("[BLE] connected")
 
-                while client.is_connected and (not stop_evt.is_set()):
-                    now = time.monotonic()
-                    if now >= next_tick:
-                        next_tick += dt
+            await client.start_notify(UART_TX_UUID, on_notify)
+            print("[BLE] notify started")
 
-                        line = build_csv_line(shared, latest_in)
+            # ★重要：接続直後は周辺が不安定になりやすいので待つ
+            await asyncio.sleep(1.0)
 
-                        # Pi local log (submission-oriented)
-                        if shared.logging:
-                            pi_log.write(line + "\n")
+            # ヘッダは基本不要（XIAOは無視する＆write負荷を減らす）
+            # await client.write_gatt_char(UART_RX_UUID, (CSV_HEADER + "\n").encode("utf-8"), response=False)
 
-                        # BLE send to XIAO
-                        try:
-                            await client.write_gatt_char(UART_RX_UUID, (line + "\n").encode("utf-8"), response=False)
-                        except (BleakError, OSError) as e:
-                            print(f"[BLE] write error: {e}")
-                            break
+            # tick loop
+            next_tick = time.monotonic()
+            dt = 1.0 / TELEM_HZ
 
-                    await asyncio.sleep(0.001)
+            backoff = 0.5  # reset backoff after successful session
 
-                print("[BLE] disconnected (inner loop end)")
+            while client.is_connected and (not stop_evt.is_set()):
+                now = time.monotonic()
+                if now >= next_tick:
+                    next_tick += dt
+
+                    line = build_csv_line(shared, latest_in)
+
+                    if shared.logging:
+                        pi_log.write(line + "\n")
+
+                    try:
+                        await client.write_gatt_char(
+                            UART_RX_UUID,
+                            (line + "\n").encode("utf-8"),
+                            response=False
+                        )
+                    except (BleakError, OSError) as e:
+                        print(f"[BLE] write error: {e}")
+                        break
+
+                await asyncio.sleep(0.001)
+
+            print("[BLE] disconnected (inner loop end)")
+
+            try:
+                await client.stop_notify(UART_TX_UUID)
+            except Exception:
+                pass
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
         except Exception as e:
             print(f"[BLE] connect/session error: {e}")
 
-        await asyncio.sleep(0.5)
+        # ★重要：指数バックオフ（本番での“揺らぎ”を吸収）
+        await asyncio.sleep(backoff)
+        backoff = min(BACKOFF_MAX, backoff * 2)
 
     try:
         pi_log.flush()
