@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import os
+import csv
 import time
 import math
 import statistics
 import threading
 from dataclasses import dataclass
 from collections import deque
+from datetime import datetime
 
 import pigpio
 import cv2
@@ -91,8 +94,6 @@ class ServoConfig:
     max_us: int = 2500
     pin18: int = 18
     pin12: int = 12
-
-    # fwd/turn の上限（set_diff）
     max_delta: int = 600
 
 class ServoDrive:
@@ -115,10 +116,6 @@ class ServoDrive:
         self.pi.set_servo_pulsewidth(self.cfg.pin12, 0)
 
     def set_diff(self, fwd, turn):
-        """
-        fwd  > 0 で前進
-        turn > 0 で右旋回（実機に合わせ、内部で符号を反転）
-        """
         # 実機挙動に合わせて旋回符号を反転（あなたの確定済み設定）
         turn = -turn
 
@@ -128,8 +125,8 @@ class ServoDrive:
         left_power = clamp_int(left_power, -self.cfg.max_delta, self.cfg.max_delta)
         right_power = clamp_int(right_power, -self.cfg.max_delta, self.cfg.max_delta)
 
-        pulse18 = self.cfg.stop_us - left_power   # pin18: 小さいほど前進
-        pulse12 = self.cfg.stop_us + right_power  # pin12: 大きいほど前進
+        pulse18 = self.cfg.stop_us - left_power
+        pulse12 = self.cfg.stop_us + right_power
         self._write(pulse18, pulse12)
 
 
@@ -142,10 +139,8 @@ class FallConfig:
     win: int = 11
     req: int = 5
     sea_level_hpa: float = 1013.25
-
     freefall_acc_th: float = 8.5
     freefall_dalt_th: float = -0.10
-
     acc_land_min: float = 6.0
     acc_land_max: float = 13.0
     land_dalt_abs_th: float = 0.05
@@ -164,10 +159,8 @@ class FallLandingDetector:
     def __init__(self, cfg: FallConfig, logger=print):
         self.cfg = cfg
         self.log = logger
-
         self.buf_acc = deque(maxlen=cfg.win)
         self.buf_dalt = deque(maxlen=cfg.win)
-
         self.prev_alt = None
         self.freefall_confirmed = False
         self.ff_consec = 0
@@ -175,7 +168,6 @@ class FallLandingDetector:
 
     def update(self, alt_m: float, acc_vec):
         c = self.cfg
-
         if self.prev_alt is None:
             self.prev_alt = alt_m
             return FallStatus(phase="WARMUP", alt=alt_m)
@@ -190,7 +182,6 @@ class FallLandingDetector:
 
         acc_med = median_or_none(self.buf_acc)
         dalt_med = median_or_none(self.buf_dalt)
-
         if acc_med is None or dalt_med is None:
             return FallStatus(phase="WARMUP", alt=alt_m)
 
@@ -236,18 +227,17 @@ class GpsConfig:
     arrival_radius_m: float = 1.0
     angle_ok_deg: float = 3.0
 
-    base_v: float = 0.70
-    min_v: float = 0.35
+    base_v: float = 0.55
+    min_v: float = 0.25
     slowdown_dist_m: float = 8.0
 
-    # 旋回制御（deg→turn）
-    kp: float = 0.020        # 0.02*90deg=1.8 → 後段で飽和
-    turn_max: float = 0.85   # 0..1
-    turn_bias: float = 0.00  # まずは0推奨
+    kp: float = 0.020
+    turn_max: float = 0.85
+    turn_bias: float = 0.00
 
-    # スタック判定
-    stuck_window_sec: float = 6.0
-    stuck_min_progress_m: float = 0.6   # この秒数でこれだけ近づけなければスタック疑い
+    stuck_window_sec: float = 4.0
+    stuck_min_progress_m: float = 0.3
+    stuck_v_gate: float = 0.35
 
 class NmeaGpsReader:
     def __init__(self, cfg: GpsConfig, logger=print):
@@ -329,14 +319,13 @@ class NmeaGpsReader:
 
 
 # ============================================================
-# 4) 磁気キャリブレーション（Qiita方式：max/min→中心）
+# 4) 磁気キャリブレーション（max/min中心）
 # ============================================================
 @dataclass
 class CompassCalib:
     valid: bool = False
     off_x: float = 0.0
     off_y: float = 0.0
-    # 取り付け/基準合わせ用（まず0、必要なら180など）
     heading_extra_offset_deg: float = 0.0
 
     def heading_from_mag(self, mag_xyz) -> float | None:
@@ -345,7 +334,6 @@ class CompassCalib:
         mx, my, mz = mag_xyz
         if mx is None or my is None:
             return None
-        # Qiitaの「中心補正」相当：mx,my からオフセットを引く :contentReference[oaicite:3]{index=3}
         x = mx - self.off_x
         y = my - self.off_y
         hdg = math.degrees(math.atan2(y, x))
@@ -353,32 +341,18 @@ class CompassCalib:
         hdg = (hdg + self.heading_extra_offset_deg) % 360.0
         return hdg
 
-def run_compass_calibration(
-    drive: ServoDrive,
-    bno,
-    calib: CompassCalib,
-    duration_sec: float = 15.0,
-    turn_power: int = 220,
-    logger=print,
-):
-    """
-    その場回転しながら磁気(x,y)のmax/minを取り、中心=(max+min)/2を推定する。
-    Qiitaの「起動後最初の15秒回転して中心を求める」方式を、BNO055のmagで実装 :contentReference[oaicite:4]{index=4}
-    """
+def run_compass_calibration(drive: ServoDrive, bno, calib: CompassCalib,
+                            duration_sec: float = 15.0, turn_power: int = 220, logger=print):
     logger(f"[CAL] Compass calibration start: rotate {duration_sec:.1f}s")
-
     max_x = max_y = None
     min_x = min_y = None
 
     t0 = time.monotonic()
-    # 右回り→左回りで偏り低減（環境依存のため）
     while (time.monotonic() - t0) < duration_sec:
         t = time.monotonic() - t0
-        # 2.5秒ごとに向きを反転
         sign = 1 if int(t / 2.5) % 2 == 0 else -1
         drive.set_diff(0, sign * turn_power)
 
-        mag = None
         try:
             mag = bno.magnetic
         except Exception:
@@ -392,7 +366,6 @@ def run_compass_calibration(
                 max_y = my if (max_y is None or my > max_y) else max_y
                 min_y = my if (min_y is None or my < min_y) else min_y
 
-        # 20Hz程度
         time.sleep(0.05)
 
     drive.stop()
@@ -406,23 +379,22 @@ def run_compass_calibration(
     calib.off_x = 0.5 * (max_x + min_x)
     calib.off_y = 0.5 * (max_y + min_y)
     calib.valid = True
-    logger(f"[CAL] DONE: off_x={calib.off_x:.3f} off_y={calib.off_y:.3f} (valid={calib.valid})")
+    logger(f"[CAL] DONE: off_x={calib.off_x:.3f} off_y={calib.off_y:.3f} valid={calib.valid}")
 
 
 # ============================================================
-# 5) リカバリ（スタック/転倒）
+# 5) リカバリ（Flip/スタック）
 # ============================================================
 @dataclass
 class RecoveryConfig:
-    flip_roll_deg: float = 120.0
-    flip_pitch_deg: float = 120.0
+    flip_roll_deg: float = 85.0
+    flip_pitch_deg: float = 85.0
 
-    # リカバリ動作パターン
-    back_ms: int = 900
-    turn_ms: int = 900
+    back_ms: int = 1200
+    turn_ms: int = 1200
     fwd_ms: int = 600
-    back_power: int = -260
-    turn_power: int = 320
+    back_power: int = -360
+    turn_power: int = 420
     fwd_power: int = 260
 
 class RecoveryManager:
@@ -459,13 +431,12 @@ class RecoveryManager:
     def start_recover(self, reason: str):
         self.log(f"[REC] start recovery: {reason}")
         self._state = 0
-        self._set_busy(1)  # すぐ次のtickへ
+        self._set_busy(1)
 
     def tick(self):
         if not self.is_busy():
-            return False  # not recovering now
+            return False
 
-        # ステートマシン：back → turn → fwd → stop
         if self._state == 0:
             self.drive.set_diff(self.cfg.back_power, 0)
             self._state = 1
@@ -491,7 +462,7 @@ class RecoveryManager:
 
 
 # ============================================================
-# 6) GPS誘導コントローラ（左右差制御に修正）
+# 6) GPS誘導（左右差制御）
 # ============================================================
 class GpsGuidance:
     def __init__(self, cfg: GpsConfig, drive: ServoDrive, bno, gps_reader: NmeaGpsReader, calib: CompassCalib, logger=print):
@@ -503,11 +474,20 @@ class GpsGuidance:
         self.log = logger
         self._last_log = time.monotonic()
 
-        # スタック判定用
         self._stuck_t0 = None
         self._stuck_d0 = None
+
+        # 状態公開用（ダウンリンク/CSV）
         self.last_dist = None
-        self.last_cmd_fwd = 0.0
+        self.last_goal_deg = None
+        self.last_head_deg = None
+        self.last_err_deg = None
+        self.last_cmd_v = 0.0
+        self.last_cmd_turn = 0.0
+        self.last_nsat = 0
+        self.last_hdop = None
+        self.last_lat = None
+        self.last_lon = None
 
     def _gps_ok(self, fix: GpsFix) -> bool:
         c = self.cfg
@@ -524,7 +504,6 @@ class GpsGuidance:
         return True
 
     def _get_heading_deg(self) -> float | None:
-        # 優先：補正済み磁気ヘディング（max/min中心補正）
         if self.calib.valid:
             try:
                 mag = self.bno.magnetic
@@ -534,7 +513,6 @@ class GpsGuidance:
             if hdg is not None:
                 return hdg
 
-        # フォールバック：BNO055の融合出力
         try:
             e = self.bno.euler
             if e is not None and e[0] is not None:
@@ -544,51 +522,60 @@ class GpsGuidance:
         return None
 
     def step(self) -> tuple[bool, bool]:
-        """
-        戻り値:
-          (arrived, stuck_suspected)
-        """
         c = self.cfg
         fix = self.gps.get()
         heading = self._get_heading_deg()
 
+        # 状態保持（ダウンリンク用）
+        self.last_lat = fix.lat
+        self.last_lon = fix.lon
+        self.last_nsat = fix.nsat
+        self.last_hdop = fix.hdop
+
         if heading is None or not self._gps_ok(fix):
             self.drive.stop()
+            self.last_head_deg = heading
+            self.last_cmd_v = 0.0
+            self.last_cmd_turn = 0.0
             return (False, False)
 
         dist = haversine_m(fix.lat, fix.lon, c.goal_lat, c.goal_lon)
-        self.last_dist = dist
-
-        if dist <= c.arrival_radius_m:
-            self.drive.stop()
-            self.log(f"[GPS] ARRIVED dist={dist:.2f}m <= {c.arrival_radius_m}m")
-            return (True, False)
-
         theta_goal = bearing_deg(fix.lat, fix.lon, c.goal_lat, c.goal_lon)
         err = wrap_to_180(theta_goal - heading)
 
-        # 距離に応じて前進割合 v を決める
+        self.last_dist = dist
+        self.last_goal_deg = theta_goal
+        self.last_head_deg = heading
+        self.last_err_deg = err
+
+        if dist <= c.arrival_radius_m:
+            self.drive.stop()
+            self.last_cmd_v = 0.0
+            self.last_cmd_turn = 0.0
+            self.log(f"[GPS] ARRIVED dist={dist:.2f}m <= {c.arrival_radius_m}m")
+            return (True, False)
+
         if dist < c.slowdown_dist_m:
             a = clamp(dist / c.slowdown_dist_m, 0.0, 1.0)
             v = c.min_v + (c.base_v - c.min_v) * a
         else:
             v = c.base_v
 
-        # 旋回割合 turn（0..1相当）を作る：左右差で効く
         if abs(err) < c.angle_ok_deg:
             turn = c.turn_bias
         else:
             turn = clamp(c.kp * err + c.turn_bias, -c.turn_max, c.turn_max)
 
-        # v,turn を set_diff へ（左右差）
         fwd_power = int(v * self.drive.cfg.max_delta)
         turn_power = int(turn * self.drive.cfg.max_delta)
         self.drive.set_diff(fwd_power, turn_power)
-        self.last_cmd_fwd = v
 
-        # ---- スタック疑い判定：一定時間で距離が減らない ----
+        self.last_cmd_v = float(v)
+        self.last_cmd_turn = float(turn)
+
+        # スタック疑い
         stuck = False
-        if v >= 0.55:  # ある程度前進指令を出している時だけ監視
+        if v >= c.stuck_v_gate:
             if self._stuck_t0 is None:
                 self._stuck_t0 = time.monotonic()
                 self._stuck_d0 = dist
@@ -597,7 +584,6 @@ class GpsGuidance:
                     progress = (self._stuck_d0 - dist) if (self._stuck_d0 is not None) else 0.0
                     if progress < c.stuck_min_progress_m:
                         stuck = True
-                    # 次窓へ更新
                     self._stuck_t0 = time.monotonic()
                     self._stuck_d0 = dist
         else:
@@ -616,7 +602,7 @@ class GpsGuidance:
 
 
 # ============================================================
-# 7) カメラ誘導（赤コーン）: HSV修正 + 段階スキャン
+# 7) カメラ誘導（赤コーン）
 # ============================================================
 @dataclass
 class CameraConfig:
@@ -627,7 +613,6 @@ class CameraConfig:
     kp_turn: float = 0.8
     base_fwd: int = 240
 
-    # SEARCH改善：速すぎる連続回転をやめる
     search_turn: int = 120
     scan_step_sec: float = 0.55
     scan_pause_sec: float = 0.12
@@ -653,13 +638,14 @@ class CameraGuidance:
         self.log = logger
         self._goal_start_t = None
 
-        # SEARCH用
         self._scan_dir = 1
         self._scan_t0 = time.monotonic()
-        self._scan_phase = "TURN"  # TURN / PAUSE
+        self._scan_phase = "TURN"
+
+        # 状態公開用
+        self.last_red_ratio = None
 
     def _make_red_mask(self, frame_bgr):
-        # ★修正：BGR入力に対してBGR2HSVが正しい
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         m1 = cv2.inRange(hsv, self.LOWER_RED1, self.UPPER_RED1)
         m2 = cv2.inRange(hsv, self.LOWER_RED2, self.UPPER_RED2)
@@ -672,10 +658,8 @@ class CameraGuidance:
         area = cv2.contourArea(contour)
         if area < self.cfg.area_track_th:
             return False, None, area
-
         peri = cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
-
         if len(approx) != 3:
             return False, approx, area
         if not cv2.isContourConvex(approx):
@@ -696,13 +680,10 @@ class CameraGuidance:
             if (now - self._scan_t0) >= c.scan_pause_sec:
                 self._scan_phase = "TURN"
                 self._scan_t0 = now
-                # 向きを時々反転（偏り低減）
                 self._scan_dir *= -1
 
     def step(self, frame_bgr) -> bool:
         c = self.cfg
-
-        # 物理設置が時計回り90° → ソフトで反時計回り90°補正
         frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
         h, w = frame.shape[:2]
@@ -711,8 +692,8 @@ class CameraGuidance:
 
         mask = self._make_red_mask(frame)
         red_ratio = cv2.countNonZero(mask) / float(h * w)
+        self.last_red_ratio = float(red_ratio)
 
-        # 0mゴール判定
         if red_ratio >= c.goal_red_ratio:
             if self._goal_start_t is None:
                 self._goal_start_t = time.time()
@@ -739,23 +720,16 @@ class CameraGuidance:
         if best is None:
             if red_ratio >= c.slow_red_ratio:
                 self.drive.set_diff(int(c.base_fwd * 0.35), 0)
-                status = "NEAR_FWD"
             else:
-                # ★改善：連続高速回転をやめ、回して止めて観測
                 self._search_scan()
-                status = "SEARCH_SCAN"
-            self._debug_show(c, frame, mask, status, red_ratio, cx_frame, best_approx)
             return False
 
         M = cv2.moments(best)
         if M["m00"] == 0:
             if red_ratio >= c.slow_red_ratio:
                 self.drive.set_diff(int(c.base_fwd * 0.35), 0)
-                status = "NEAR_FWD"
             else:
                 self._search_scan()
-                status = "M00=0"
-            self._debug_show(c, frame, mask, status, red_ratio, cx_frame, best_approx)
             return False
 
         cx = int(M["m10"] / M["m00"])
@@ -767,35 +741,128 @@ class CameraGuidance:
             else:
                 fwd = c.base_fwd if best_area < c.area_fwd_th else int(c.base_fwd * 0.8)
             self.drive.set_diff(fwd, 0)
-            status = "FORWARD"
         else:
             turn_gain = 0.55 if red_ratio >= c.slow_red_ratio else 1.0
             turn = int(turn_gain * c.kp_turn * err)
-            # 旋回が強すぎると一瞬で視野外 → 飽和
             turn = clamp_int(turn, -420, 420)
             self.drive.set_diff(0, turn)
-            status = "TURN"
 
-        self._debug_show(c, frame, mask, status, red_ratio, cx_frame, best_approx)
         return False
-
-    def _debug_show(self, c, frame, mask, status, red_ratio, cx_frame, best_approx):
-        if not c.show_debug:
-            return
-        h, w = frame.shape[:2]
-        disp = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        cv2.line(disp, (cx_frame, 0), (cx_frame, h), (255, 255, 255), 1)
-        if best_approx is not None:
-            cv2.drawContours(disp, [best_approx], -1, (0, 255, 0), 2)
-        cv2.putText(disp, f"{status} red_ratio={red_ratio:.2f}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.imshow("Camera", disp)
-        cv2.imshow("Mask", mask)
-        cv2.waitKey(1)
 
 
 # ============================================================
-# 8) フェーズ
+# 8) TWELITE Soft UART（送信専用）
+# ============================================================
+BAUD = 38400
+TWE_RX_GPIO = 14
+TWE_TX_GPIO = 15
+DATA_BITS = 8
+STOP_BITS = 1
+
+class SoftUartTwelite:
+    def __init__(self, pi: pigpio.pi, tx_gpio: int, rx_gpio: int, baud: int):
+        self.pi = pi
+        self.tx = tx_gpio
+        self.rx = rx_gpio
+        self.baud = baud
+
+        self.pi.set_mode(self.tx, pigpio.OUTPUT)
+        self.pi.write(self.tx, 1)
+
+        # 受信は今回は未使用だがopenしておく（将来拡張）
+        self.pi.set_mode(self.rx, pigpio.INPUT)
+        self.pi.bb_serial_read_open(self.rx, self.baud, DATA_BITS)
+        time.sleep(0.05)
+
+    def close(self):
+        try:
+            self.pi.bb_serial_read_close(self.rx)
+        except pigpio.error:
+            pass
+
+    def send_line(self, s: str):
+        b = (s.strip() + "\r\n").encode("ascii", errors="ignore")
+        self.pi.wave_clear()
+        self.pi.wave_add_serial(self.tx, self.baud, DATA_BITS, STOP_BITS, 0, b)
+        wid = self.pi.wave_create()
+        if wid < 0:
+            raise RuntimeError("wave_create failed")
+        self.pi.wave_send_once(wid)
+        while self.pi.wave_tx_busy():
+            time.sleep(0.001)
+        self.pi.wave_delete(wid)
+
+
+# ============================================================
+# 9) ダウンリンク + CSV（同一内容）
+# ============================================================
+DOWNLINK_HZ = 1.0
+
+DL_FIELDS = [
+    "t_iso", "phase", "calib", "flip", "stuck",
+    "lat", "lon", "dist_m", "goal_deg", "head_deg", "err_deg",
+    "cmd_v", "cmd_turn", "nsat", "hdop", "red_ratio"
+]
+
+class DownlinkCsvLogger:
+    def __init__(self, tw: SoftUartTwelite | None, csv_path: str, logger=print):
+        self.tw = tw
+        self.csv_path = csv_path
+        self.log = logger
+
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        self._fp = open(csv_path, "a", newline="", encoding="utf-8")
+        self._w = csv.DictWriter(self._fp, fieldnames=DL_FIELDS)
+
+        if self._fp.tell() == 0:
+            self._w.writeheader()
+            self._fp.flush()
+
+    def close(self):
+        try:
+            self._fp.flush()
+            self._fp.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _fmt(x):
+        if x is None:
+            return ""
+        if isinstance(x, float):
+            return f"{x:.6f}"
+        return str(x)
+
+    def emit(self, row: dict):
+        # 欠けているキーがあっても落ちないように埋める
+        out = {k: row.get(k, "") for k in DL_FIELDS}
+
+        # CSV
+        self._w.writerow({k: self._fmt(v) for k, v in out.items()})
+        self._fp.flush()
+
+        # TWELITE
+        if self.tw is not None:
+            line = ",".join(self._fmt(out[k]) for k in DL_FIELDS)
+            try:
+                self.tw.send_line(line)
+            except Exception as e:
+                self.log(f"[DL] send error: {e}")
+
+
+# ============================================================
+# 10) GPIOパルス
+# ============================================================
+def gpio_pulse_high(pi: pigpio.pi, gpio_pin: int, sec: float, logger=print):
+    pi.write(gpio_pin, 1)
+    logger(f"[GPIO] PIN{gpio_pin} HIGH for {sec:.2f}s")
+    time.sleep(sec)
+    pi.write(gpio_pin, 0)
+    logger(f"[GPIO] PIN{gpio_pin} LOW")
+
+
+# ============================================================
+# 11) フェーズ
 # ============================================================
 class Phase:
     DROP = "DROP"
@@ -806,15 +873,8 @@ class Phase:
 
 
 # ============================================================
-# 9) メイン
+# 12) メイン
 # ============================================================
-def gpio_pulse_high(pi: pigpio.pi, gpio_pin: int, sec: float, logger=print):
-    pi.write(gpio_pin, 1)
-    logger(f"[GPIO] PIN{gpio_pin} HIGH for {sec:.2f}s")
-    time.sleep(sec)
-    pi.write(gpio_pin, 0)
-    logger(f"[GPIO] PIN{gpio_pin} LOW")
-
 def main():
     fall_cfg = FallConfig(dt=0.10, win=11, req=3, sea_level_hpa=1013.25)
 
@@ -828,8 +888,6 @@ def main():
     cam_cfg = CameraConfig(w=480, h=640, show_debug=False)
 
     GPIO_LANDING_PIN = 17
-
-    # ---- ここを必要なら変更（0 or 180などで即テスト可能）----
     HEADING_EXTRA_OFFSET_DEG = 0.0
 
     pi = pigpio.pi()
@@ -839,8 +897,7 @@ def main():
     pi.set_mode(GPIO_LANDING_PIN, pigpio.OUTPUT)
     pi.write(GPIO_LANDING_PIN, 0)
 
-    servo_cfg = ServoConfig(stop_us=1490, min_us=500, max_us=2500, pin18=18, pin12=12, max_delta=500)
-    drive = ServoDrive(pi, servo_cfg)
+    drive = ServoDrive(pi, ServoConfig(pin18=18, pin12=12, max_delta=600))
 
     i2c = busio.I2C(board.SCL, board.SDA)
     bno = adafruit_bno055.BNO055_I2C(i2c, address=0x28)
@@ -855,26 +912,37 @@ def main():
     calib = CompassCalib(valid=False, heading_extra_offset_deg=HEADING_EXTRA_OFFSET_DEG)
     gps_guidance = GpsGuidance(gps_cfg, drive, bno, gps_reader, calib, logger=print)
 
-    rec_cfg = RecoveryConfig()
-    recovery = RecoveryManager(rec_cfg, drive, bno, logger=print)
+    recovery = RecoveryManager(RecoveryConfig(), drive, bno, logger=print)
 
     cam_guidance = CameraGuidance(cam_cfg, drive, logger=print)
     picam2 = None
+
+    # ---- TWELITE & CSV Logger ----
+    tw = SoftUartTwelite(pi, tx_gpio=TWE_TX_GPIO, rx_gpio=TWE_RX_GPIO, baud=BAUD)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = f"./logs/cansat_{ts}.csv"
+    dl = DownlinkCsvLogger(tw, csv_path, logger=print)
+    print(f"[DL] CSV={csv_path} / TWELITE {BAUD}bps TX={TWE_TX_GPIO} RX={TWE_RX_GPIO}")
 
     phase = Phase.DROP
     print("=== CanSat Integrated Program Start ===")
     print(f"Phase: {phase}")
 
+    last_dl = 0.0
+    last_flip = 0
+    last_stuck = 0
+
     try:
         while phase != Phase.DONE:
-            # どのフェーズでも転倒復帰は最優先（センサが取れるときのみ）
+            # ---- Flip最優先 ----
             if not recovery.is_busy() and recovery.detect_flip():
+                last_flip = 1
                 recovery.start_recover("FLIP detected")
             if recovery.is_busy():
                 recovery.tick()
                 time.sleep(0.05)
-                continue
 
+            # ---- 各フェーズ処理 ----
             if phase == Phase.DROP:
                 alt = bme.altitude
                 acc = bno.acceleration
@@ -882,69 +950,41 @@ def main():
 
                 if st.phase == "WARMUP":
                     time.sleep(fall_cfg.dt)
-                    continue
-
-                if st.phase == "FREEFALL":
-                    print(f"[DROP] FREEFALL? alt={st.alt:.2f} acc_med={st.acc_med:.2f} "
-                          f"dalt_med={st.dalt_med:.3f} cond={st.cond} consec={st.consec}")
+                elif st.phase == "FREEFALL":
                     if st.confirmed:
                         detector.freefall_confirmed = True
                         detector.land_consec = 0
-                        print("[DROP] FREEFALL CONFIRMED")
-
                 elif st.phase == "LANDING":
-                    print(f"[DROP] LAND? alt={st.alt:.2f} acc_med={st.acc_med:.2f} "
-                          f"dalt_med={st.dalt_med:.3f} cond={st.cond} consec={st.consec}")
                     if st.confirmed:
-                        print("[DROP] LANDING CONFIRMED")
                         gpio_pulse_high(pi, GPIO_LANDING_PIN, 1.0, logger=print)
-                        
-                        pi.set_servo_pulsewidth(SERVO1_PIN, 2000)
-                        pi.set_servo_pulsewidth(SERVO2_PIN, 2000)
-                        print("Positive servos...")
-                        time.sleep(3)
-                        pi.set_servo_pulsewidth(SERVO1_PIN, 1490)
-                        pi.set_servo_pulsewidth(SERVO2_PIN, 1490)
-                        print("Stopping servos...")
-
-                        # ★追加：キャリブレーションへ
                         phase = Phase.CALIB
                         print(f"Phase: {phase}")
-
+                # DROP中はGPSログは空でもOK
                 time.sleep(fall_cfg.dt)
-                continue
 
-            # --- 追加フェーズ：磁気キャリブ（15秒回転）---
-            if phase == Phase.CALIB:
+            elif phase == Phase.CALIB:
                 drive.stop()
                 time.sleep(0.2)
-                run_compass_calibration(
-                    drive=drive,
-                    bno=bno,
-                    calib=calib,
-                    duration_sec=15.0,
-                    turn_power=220,
-                    logger=print,
-                )
+                run_compass_calibration(drive, bno, calib, duration_sec=15.0, turn_power=220, logger=print)
                 phase = Phase.GPS
                 print(f"Phase: {phase}")
-                continue
 
-            if phase == Phase.GPS:
+            elif phase == Phase.GPS:
                 dt = 1.0 / gps_cfg.control_hz
                 t0 = time.monotonic()
 
                 arrived, stuck = gps_guidance.step()
+                last_stuck = 1 if stuck else 0
                 if stuck and not recovery.is_busy():
                     recovery.start_recover("STUCK suspected (GPS progress low)")
+
                 if arrived:
                     phase = Phase.CAMERA
                     print(f"Phase: {phase}")
 
                 time.sleep(max(0.0, dt - (time.monotonic() - t0)))
-                continue
 
-            if phase == Phase.CAMERA:
+            elif phase == Phase.CAMERA:
                 if picam2 is None:
                     picam2 = Picamera2()
                     config = picam2.create_preview_configuration(
@@ -957,14 +997,42 @@ def main():
                     print("[CAM] Camera started")
 
                 frame = picam2.capture_array("main")
-                if frame is None:
-                    continue
+                if frame is not None:
+                    goal = cam_guidance.step(frame)
+                    if goal:
+                        phase = Phase.DONE
+                        print(f"Phase: {phase}")
 
-                goal = cam_guidance.step(frame)
-                if goal:
-                    phase = Phase.DONE
-                    print(f"Phase: {phase}")
-                continue
+            # ---- 1Hz ダウンリンク + CSV ----
+            now = time.monotonic()
+            if (now - last_dl) >= (1.0 / DOWNLINK_HZ):
+                last_dl = now
+
+                row = {
+                    "t_iso": datetime.now().isoformat(timespec="seconds"),
+                    "phase": phase,
+                    "calib": 1 if calib.valid else 0,
+                    "flip": last_flip,
+                    "stuck": last_stuck,
+
+                    "lat": gps_guidance.last_lat,
+                    "lon": gps_guidance.last_lon,
+                    "dist_m": gps_guidance.last_dist,
+                    "goal_deg": gps_guidance.last_goal_deg,
+                    "head_deg": gps_guidance.last_head_deg,
+                    "err_deg": gps_guidance.last_err_deg,
+                    "cmd_v": gps_guidance.last_cmd_v,
+                    "cmd_turn": gps_guidance.last_cmd_turn,
+                    "nsat": gps_guidance.last_nsat,
+                    "hdop": gps_guidance.last_hdop,
+
+                    "red_ratio": cam_guidance.last_red_ratio if phase == Phase.CAMERA else None,
+                }
+                dl.emit(row)
+
+                # 1Hzフラグは送信後にクリア（瞬間イベントとして扱う）
+                last_flip = 0
+                last_stuck = 0
 
     except KeyboardInterrupt:
         print("Ctrl-C")
@@ -985,8 +1053,11 @@ def main():
         except Exception:
             pass
         try:
-            if cam_cfg.show_debug:
-                cv2.destroyAllWindows()
+            dl.close()
+        except Exception:
+            pass
+        try:
+            tw.close()
         except Exception:
             pass
         try:
@@ -995,6 +1066,7 @@ def main():
         except Exception:
             pass
         print("=== Finish ===")
+
 
 if __name__ == "__main__":
     main()
