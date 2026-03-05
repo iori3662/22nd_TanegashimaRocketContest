@@ -171,10 +171,10 @@ class ServoDrive:
 
     def set_vw(self, v, w):
         """
-        v: 前進 0..1
+        v: 前後進 -1..+1
         w: 右旋回 +、左旋回 -
         """
-        v = clamp(v, 0.0, 1.0)
+        v = clamp(v, -1.0, 1.0)
         w = clamp(w, -1.0, 1.0)
 
         us18 = self.cfg.stop_us - v * self.cfg.scale_us + w * self.cfg.scale_us
@@ -524,6 +524,7 @@ class GpsGuidance:
         self.bno = bno
         self.gps = gps_reader
         self._last_log = time.monotonic()
+        self.heading_offset_deg = 0.0
 
     def _gps_ok(self, fix: GpsFix) -> bool:
         c = self.cfg
@@ -539,22 +540,20 @@ class GpsGuidance:
             return False
         return True
 
-    def step(self) -> dict:
-        """
-        戻り値（提出・ダウンリンク用）:
-          arrived: bool
-          dist, bearing_goal, heading, err, v, w
-        """
-        c = self.cfg
-        fix = self.gps.get()
-
-        heading = None
+    def _get_heading_deg(self) -> Optional[float]:
         try:
             e = self.bno.euler
-            if e is not None:
-                heading = e[0]  # 北0 東90
+            if e is None or e[0] is None:
+                return None
+            hd = float(e[0]) + float(self.heading_offset_deg)
+            return (hd + 360.0) % 360.0
         except Exception:
-            heading = None
+            return None
+
+    def step(self) -> dict:
+        c = self.cfg
+        fix = self.gps.get()
+        heading = self._get_heading_deg()
 
         if heading is None or not self._gps_ok(fix):
             self.drive.stop()
@@ -568,7 +567,7 @@ class GpsGuidance:
                 "arrived": True,
                 "dist": dist,
                 "bearing_goal": None,
-                "heading": float(heading),
+                "heading": heading,
                 "err": None,
                 "v": 0.0,
                 "w": 0.0,
@@ -577,16 +576,20 @@ class GpsGuidance:
         theta_goal = bearing_deg(fix.lat, fix.lon, c.goal_lat, c.goal_lon)
         err = wrap_to_180(theta_goal - heading)
 
-        if dist < c.slowdown_dist_m:
-            a = clamp(dist / c.slowdown_dist_m, 0.0, 1.0)
-            v = c.min_v + (c.base_v - c.min_v) * a
+        turn_in_place_deg = 70.0
+        if abs(err) >= turn_in_place_deg:
+            v = 0.0
         else:
-            v = c.base_v
+            v_scale = max(0.0, math.cos(math.radians(err)))
+            if dist < c.slowdown_dist_m:
+                a = clamp(dist / c.slowdown_dist_m, 0.0, 1.0)
+                v_base = c.min_v + (c.base_v - c.min_v) * a
+            else:
+                v_base = c.base_v
+            v = v_base * v_scale
 
-        if abs(err) < c.angle_ok_deg:
-            w = c.w_bias
-        else:
-            w = clamp(c.kp * err + c.w_bias, -c.w_max, c.w_max)
+        w_bias = 0.0
+        w = clamp(c.kp * err + w_bias, -c.w_max, c.w_max)
 
         self.drive.set_vw(v, w)
 
@@ -599,12 +602,11 @@ class GpsGuidance:
             "arrived": False,
             "dist": dist,
             "bearing_goal": theta_goal,
-            "heading": float(heading),
+            "heading": heading,
             "err": float(err),
             "v": float(v),
             "w": float(w),
         }
-
 
 # ============================================================
 # 6) カメラ誘導（モード/赤率を返す）
@@ -617,7 +619,8 @@ class CameraConfig:
 
     kp_turn: float = 0.8
     base_fwd: int = 250
-    search_turn: int = 200
+    search_turn: int = 120
+    acquire_turn_max: int = 220
     area_track_th: int = 900
     area_fwd_th: int = 2200
     center_tol_ratio: float = 0.08
@@ -626,9 +629,14 @@ class CameraConfig:
     goal_red_ratio: float = 0.60
     goal_hold_sec: float = 0.25
 
+    acquire_red_ratio: float = 0.010
+    acquire_hold_frames: int = 4
+    lost_hold_sec: float = 0.8
+
 
 class CameraGuidance:
     """
+    SEARCH/ACQUIRE/TRACK の状態機械を入れて「捕捉」を安定化。
     戻り値:
       {"goal": bool, "mode": str, "red_ratio": float}
     """
@@ -643,6 +651,10 @@ class CameraGuidance:
         self.cfg = cfg
         self.drive = drive
         self._goal_start_t = None
+        self.state = "SEARCH"
+        self._acq_count = 0
+        self._last_seen_t = 0.0
+        self._last_err_px = 0
 
     def _run_fallback(self, red_ratio: float, default_mode: str):
         if red_ratio >= self.cfg.slow_red_ratio:
@@ -660,23 +672,27 @@ class CameraGuidance:
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self.KERNEL)
         return mask
 
-    def _is_triangle_like(self, contour, min_area):
-        area = cv2.contourArea(contour)
-        if area < min_area:
-            return False, None, area
-        peri = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
-        if len(approx) != 3:
-            return False, approx, area
-        if not cv2.isContourConvex(approx):
-            return False, approx, area
-        return True, approx, area
+    def _largest_blob_centroid(self, mask):
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None, 0.0
+
+        best = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(best))
+        if area <= 0:
+            return None, 0.0
+
+        m = cv2.moments(best)
+        if m["m00"] == 0:
+            return None, area
+
+        cx = int(m["m10"] / m["m00"])
+        return cx, area
 
     def step(self, frame_bgr) -> dict:
         c = self.cfg
 
         frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
         h, w = frame.shape[:2]
         cx_frame = w // 2
         center_tol_px = int(w * c.center_tol_ratio)
@@ -690,11 +706,13 @@ class CameraGuidance:
                 self._goal_start_t = now
             elif (now - self._goal_start_t) >= c.goal_hold_sec:
                 self.drive.stop()
+                self.state = "GOAL"
                 return {"goal": True, "mode": "GOAL", "red_ratio": red_ratio}
         else:
             self._goal_start_t = None
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cx_blob, area_blob = self._largest_blob_centroid(mask)
+        seen = (cx_blob is not None) and (red_ratio >= c.acquire_red_ratio)
 
         best = None
         best_area = 0.0
@@ -717,38 +735,57 @@ class CameraGuidance:
             self._debug_show(frame, mask, mode, red_ratio, cx_frame, best_approx)
             return {"goal": False, "mode": mode, "red_ratio": red_ratio}
 
-        cx = int(M["m10"] / M["m00"])
-        err_px = cx - cx_frame
+        now = time.time()
 
-        if abs(err_px) < center_tol_px:
-            if red_ratio >= c.slow_red_ratio:
-                fwd = int(c.base_fwd * 0.35)
+        if self.state == "SEARCH":
+            if seen:
+                self.state = "ACQUIRE"
+                self._acq_count = 0
             else:
-                fwd = c.base_fwd if best_area < c.area_fwd_th else int(c.base_fwd * 0.8)
-            self.drive.set_diff(fwd, 0)
-            mode = "FORWARD"
-        else:
-            turn_gain = 0.6 if red_ratio >= c.slow_red_ratio else 1.0
-            turn = int(turn_gain * c.kp_turn * err_px)
-            self.drive.set_diff(0, turn)
-            mode = "TURN"
+                self.drive.set_diff(0, c.search_turn)
+                return {"goal": False, "mode": "SEARCH", "red_ratio": red_ratio}
 
-        self._debug_show(frame, mask, mode, red_ratio, cx_frame, best_approx)
-        return {"goal": False, "mode": mode, "red_ratio": red_ratio}
+        if self.state == "ACQUIRE":
+            if seen:
+                turn = int(clamp(c.kp_turn * self._last_err_px, -c.acquire_turn_max, c.acquire_turn_max))
+                self.drive.set_diff(0, turn)
+                self._acq_count += 1
+                if self._acq_count >= c.acquire_hold_frames:
+                    self.state = "TRACK"
+                return {"goal": False, "mode": "ACQUIRE", "red_ratio": red_ratio}
 
-    def _debug_show(self, frame, mask, mode, red_ratio, cx_frame, best_approx):
-        if not self.cfg.show_debug:
-            return
-        h, w = frame.shape[:2]
-        disp = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        cv2.line(disp, (cx_frame, 0), (cx_frame, h), (255, 255, 255), 1)
-        if best_approx is not None:
-            cv2.drawContours(disp, [best_approx], -1, (0, 255, 0), 2)
-        cv2.putText(disp, f"{mode} rr={red_ratio:.3f}", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.imshow("Camera", disp)
-        cv2.imshow("Mask", mask)
-        cv2.waitKey(1)
+            if (now - self._last_seen_t) <= c.lost_hold_sec:
+                turn_dir = 1 if self._last_err_px >= 0 else -1
+                self.drive.set_diff(0, turn_dir * c.search_turn)
+                return {"goal": False, "mode": "ACQUIRE_LOST", "red_ratio": red_ratio}
+
+            self.state = "SEARCH"
+            self.drive.set_diff(0, c.search_turn)
+            return {"goal": False, "mode": "SEARCH", "red_ratio": red_ratio}
+
+        if self.state == "TRACK":
+            if seen:
+                if abs(self._last_err_px) < center_tol_px:
+                    fwd = int(c.base_fwd * (0.35 if red_ratio >= c.slow_red_ratio else 1.0))
+                    self.drive.set_diff(fwd, 0)
+                    return {"goal": False, "mode": "TRACK_FWD", "red_ratio": red_ratio}
+
+                gain = 0.6 if red_ratio >= c.slow_red_ratio else 1.0
+                turn = int(gain * c.kp_turn * self._last_err_px)
+                self.drive.set_diff(0, turn)
+                return {"goal": False, "mode": "TRACK_TURN", "red_ratio": red_ratio}
+
+            if (now - self._last_seen_t) <= c.lost_hold_sec:
+                turn_dir = 1 if self._last_err_px >= 0 else -1
+                self.drive.set_diff(0, turn_dir * c.search_turn)
+                return {"goal": False, "mode": "TRACK_LOST", "red_ratio": red_ratio}
+
+            self.state = "SEARCH"
+            self.drive.set_diff(0, c.search_turn)
+            return {"goal": False, "mode": "SEARCH", "red_ratio": red_ratio}
+
+        self.drive.stop()
+        return {"goal": False, "mode": "UNKNOWN", "red_ratio": red_ratio}
 
 
 # ============================================================
@@ -1114,6 +1151,79 @@ def gpio_pulse_high(pi: pigpio.pi, gpio_pin: int, sec: float):
 
 
 # ============================================================
+# 10.5) 安全監視（転倒/スタック）
+# ============================================================
+@dataclass
+class SafetyConfig:
+    flip_deg: float = 80.0
+    flip_hold_sec: float = 0.5
+    stuck_window_sec: float = 10.0
+    stuck_min_progress_m: float = 0.5
+    stuck_v_th: float = 0.30
+
+
+class SafetyMonitor:
+    def __init__(self, cfg: SafetyConfig):
+        self.cfg = cfg
+        self._flip_start_t = None
+        self._dist_hist = deque()
+        self._recover_until = 0.0
+
+    def check_flip(self, pitch_deg: Optional[float], roll_deg: Optional[float]) -> bool:
+        c = self.cfg
+        if pitch_deg is None or roll_deg is None:
+            self._flip_start_t = None
+            return False
+
+        flipped = (abs(pitch_deg) >= c.flip_deg) or (abs(roll_deg) >= c.flip_deg)
+        now = time.time()
+        if flipped:
+            if self._flip_start_t is None:
+                self._flip_start_t = now
+            elif (now - self._flip_start_t) >= c.flip_hold_sec:
+                return True
+        else:
+            self._flip_start_t = None
+        return False
+
+    def update_dist(self, dist_m: Optional[float], v_cmd: Optional[float]) -> bool:
+        c = self.cfg
+        if dist_m is None:
+            return False
+
+        now = time.time()
+        self._dist_hist.append((now, float(dist_m)))
+        while self._dist_hist and (now - self._dist_hist[0][0]) > c.stuck_window_sec:
+            self._dist_hist.popleft()
+
+        if v_cmd is None or v_cmd < c.stuck_v_th or len(self._dist_hist) < 2:
+            return False
+
+        d0 = self._dist_hist[0][1]
+        d1 = self._dist_hist[-1][1]
+        return (d0 - d1) < c.stuck_min_progress_m
+
+    def recovering(self) -> bool:
+        return time.time() < self._recover_until
+
+    def start_recovery(self, sec: float = 2.0):
+        self._recover_until = time.time() + sec
+
+    def recovery_step(self, drive: ServoDrive):
+        remain = self._recover_until - time.time()
+        if remain <= 0:
+            return
+        elapsed = 2.0 - remain
+        if elapsed < 0.4:
+            drive.stop()
+        elif elapsed < 1.2:
+            drive.set_vw(-0.45, 0.0)
+        else:
+            w = 0.45 if (int(time.time()) % 2 == 0) else -0.45
+            drive.set_vw(0.0, w)
+
+
+# ============================================================
 # 11) メイン
 # ============================================================
 def main():
@@ -1187,6 +1297,10 @@ def main():
     detector = FallLandingDetector(fall_cfg)
     gps_guidance = GpsGuidance(gps_cfg, drive, bno, gps_reader)
     cam_guidance = CameraGuidance(cam_cfg, drive)
+    safety = SafetyMonitor(SafetyConfig())
+
+    mission_t0 = None
+    FORCE_GOAL_SEC = 19 * 60
 
     # -------------------------
     # Telemetry/log record pipeline
@@ -1259,6 +1373,13 @@ def main():
         while (not stop_flag.is_set()) and (phase != Phase.DONE):
             now = time.monotonic()
 
+            if mission_t0 is not None and (time.time() - mission_t0) >= FORCE_GOAL_SEC:
+                print("[TIMEOUT] 19min reached -> FORCE DONE")
+                phase = Phase.DONE
+                telem.phase = phase
+                drive.stop()
+                break
+
             # ========================================================
             # (A) BLEコマンド反映（mode/phase_override/logging）
             # ========================================================
@@ -1315,6 +1436,8 @@ def main():
                 telem.land_consec = st.land_consec
 
                 if st.phase == "LANDING" and st.landing_confirmed:
+                    if mission_t0 is None:
+                        mission_t0 = time.time()
                     print("[DROP] LANDING CONFIRMED")
                     gpio_pulse_high(pi, GPIO_LANDING_PIN, 1.0)
 
@@ -1328,9 +1451,17 @@ def main():
                 dt = 1.0 / gps_cfg.control_hz
                 t0 = time.monotonic()
 
+                e = bno.euler
+                roll = e[1] if (e is not None and e[1] is not None) else None
+                pitch = e[2] if (e is not None and e[2] is not None) else None
+                if safety.check_flip(pitch, roll):
+                    print("[SAFETY] FLIP detected -> STOP")
+                    drive.stop()
+                    time.sleep(0.2)
+                    continue
+
                 out = gps_guidance.step()
 
-                # ★必須：距離・制御履歴（提出/無線バックアップ）
                 if "dist" in out:
                     telem.dist_to_goal_m = out.get("dist")
                     telem.bearing_goal_deg = out.get("bearing_goal")
@@ -1339,6 +1470,13 @@ def main():
                     telem.v_cmd = out.get("v")
                     telem.w_cmd = out.get("w")
 
+                if safety.recovering():
+                    safety.recovery_step(drive)
+                else:
+                    if safety.update_dist(out.get("dist"), out.get("v")):
+                        print("[SAFETY] STUCK suspected -> recovery")
+                        safety.start_recovery(sec=2.0)
+
                 if out.get("arrived", False):
                     phase = Phase.CAMERA
                     print(f"Phase: {phase}")
@@ -1346,6 +1484,15 @@ def main():
                 time.sleep(max(0.0, dt - (time.monotonic() - t0)))
 
             elif phase == Phase.CAMERA:
+                e = bno.euler
+                roll = e[1] if (e is not None and e[1] is not None) else None
+                pitch = e[2] if (e is not None and e[2] is not None) else None
+                if safety.check_flip(pitch, roll):
+                    print("[SAFETY] FLIP detected -> STOP")
+                    drive.stop()
+                    time.sleep(0.2)
+                    continue
+
                 if picam2 is None:
                     picam2 = Picamera2()
                     config = picam2.create_preview_configuration(
