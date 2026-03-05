@@ -73,11 +73,7 @@ def clamp_int(x, lo, hi):
     return int(max(lo, min(hi, int(x))))
 
 def wrap_to_180(a_deg):
-    while a_deg > 180:
-        a_deg -= 360
-    while a_deg < -180:
-        a_deg += 360
-    return a_deg
+    return ((a_deg + 180) % 360) - 180
 
 def norm3(v):
     if v is None:
@@ -85,7 +81,7 @@ def norm3(v):
     x, y, z = v
     if x is None or y is None or z is None:
         return None
-    return math.sqrt(x * x + y * y + z * z)
+    return math.hypot(x, y, z)
 
 def median_or_none(buf: deque):
     if len(buf) < buf.maxlen:
@@ -660,6 +656,13 @@ class CameraGuidance:
         self._last_seen_t = 0.0
         self._last_err_px = 0
 
+    def _run_fallback(self, red_ratio: float, default_mode: str):
+        if red_ratio >= self.cfg.slow_red_ratio:
+            self.drive.set_diff(int(self.cfg.base_fwd * 0.35), 0)
+            return "NEAR_FWD"
+        self.drive.set_diff(0, self.cfg.search_turn)
+        return default_mode
+
     def _make_red_mask(self, frame_bgr):
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         m1 = cv2.inRange(hsv, self.LOWER_RED1, self.UPPER_RED1)
@@ -697,10 +700,11 @@ class CameraGuidance:
         mask = self._make_red_mask(frame)
         red_ratio = cv2.countNonZero(mask) / float(h * w)
 
+        now = time.time()
         if red_ratio >= c.goal_red_ratio:
             if self._goal_start_t is None:
-                self._goal_start_t = time.time()
-            elif (time.time() - self._goal_start_t) >= c.goal_hold_sec:
+                self._goal_start_t = now
+            elif (now - self._goal_start_t) >= c.goal_hold_sec:
                 self.drive.stop()
                 self.state = "GOAL"
                 return {"goal": True, "mode": "GOAL", "red_ratio": red_ratio}
@@ -710,10 +714,26 @@ class CameraGuidance:
         cx_blob, area_blob = self._largest_blob_centroid(mask)
         seen = (cx_blob is not None) and (red_ratio >= c.acquire_red_ratio)
 
-        if seen:
-            err_px = cx_blob - cx_frame
-            self._last_seen_t = time.time()
-            self._last_err_px = int(err_px)
+        best = None
+        best_area = 0.0
+        best_approx = None
+        for ct in contours:
+            ok, approx, area = self._is_triangle_like(ct, c.area_track_th)
+            if ok and area > best_area:
+                best = ct
+                best_area = float(area)
+                best_approx = approx
+
+        if best is None:
+            mode = self._run_fallback(red_ratio, "SEARCH")
+            self._debug_show(frame, mask, mode, red_ratio, cx_frame, best_approx)
+            return {"goal": False, "mode": mode, "red_ratio": red_ratio}
+
+        M = cv2.moments(best)
+        if M["m00"] == 0:
+            mode = self._run_fallback(red_ratio, "BAD_MOMENT")
+            self._debug_show(frame, mask, mode, red_ratio, cx_frame, best_approx)
+            return {"goal": False, "mode": mode, "red_ratio": red_ratio}
 
         now = time.time()
 
@@ -1033,7 +1053,7 @@ class BleWorker(threading.Thread):
 
     async def _runner(self):
         # notify callback（XIAO->Pi）
-        async def on_notify(_, data: bytearray):
+        def on_notify(_, data: bytearray):
             try:
                 s = data.decode("utf-8", errors="ignore").strip()
             except Exception:
