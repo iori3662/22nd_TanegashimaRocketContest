@@ -1400,27 +1400,7 @@ def main():
             # ========================================================
             # (B) テレメに共通値を反映（毎ループ）
             # ========================================================
-            telem.phase = phase
-            telem.servo18_us = drive.last_us18
-            telem.servo12_us = drive.last_us12
-
-            # BME280
-            try:
-                telem.temp_c = float(bme.temperature)
-                telem.press_hpa = float(bme.pressure)
-                telem.humid_pct = float(bme.humidity)
-                telem.alt_bme_m = float(bme.altitude)
-            except Exception:
-                pass
-
-            # GPS fix
-            fix = gps_reader.get()
-            telem.lat = fix.lat
-            telem.lon = fix.lon
-            telem.gps_alt = fix.alt
-            telem.fixq = fix.fixq
-            telem.nsat = fix.nsat
-            telem.hdop = fix.hdop
+            _apply_common_telemetry(telem, phase, drive, bme, gps_reader)
 
             # ========================================================
             # (C) フェーズ処理
@@ -1527,46 +1507,29 @@ def main():
             #     - BLE送信用 line 更新
             # ========================================================
             now2 = time.monotonic()
-            if now2 >= next_record:
-                next_record += 1.0 / LOG_HZ
-
-                telem.seq += 1
-                t_ms = int(now2 * 1000)
-                line = fmt.format_line(t_ms, telem)
-
-                # Piローカルログ（提出向け）
-                if logging_enabled:
-                    try:
-                        log_f.write(line + "\n")
-                    except Exception as e:
-                        print("[PI LOG] write error:", e)
-
-                # BLEへ渡す（BLEはこの line をそのまま送る）
-                with record_lock:
-                    record_line_ref["line"] = line
-                    record_line_ref["updated_t"] = now2
+            next_record = _publish_record_if_due(
+                now2,
+                next_record,
+                LOG_HZ,
+                telem,
+                fmt,
+                logging_enabled,
+                log_f,
+                record_lock,
+                record_line_ref,
+            )
 
             # ========================================================
             # (E) 1Hz: TWELITE 送信（最新の正本 line を送る）
             # ========================================================
-            if now2 >= next_tw_send:
-                next_tw_send += 1.0 / TW_SEND_HZ
-                with record_lock:
-                    line = record_line_ref.get("line", "")
-
-                if line:
-                    try:
-                        tw.write_line(line)
-                    except Exception as e:
-                        print("[TW] send error:", e)
-
-                # 必要ならTWELITE受信も読む（任意）
-                try:
-                    for r in tw.read_lines():
-                        if r:
-                            print("[TW RX]", r)
-                except Exception:
-                    pass
+            next_tw_send = _send_twelite_if_due(
+                now2,
+                next_tw_send,
+                TW_SEND_HZ,
+                record_lock,
+                record_line_ref,
+                tw,
+            )
 
     except KeyboardInterrupt:
         stop_flag.set()
