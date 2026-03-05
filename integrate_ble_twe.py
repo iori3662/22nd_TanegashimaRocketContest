@@ -656,13 +656,6 @@ class CameraGuidance:
         self._last_seen_t = 0.0
         self._last_err_px = 0
 
-    def _run_fallback(self, red_ratio: float, default_mode: str):
-        if red_ratio >= self.cfg.slow_red_ratio:
-            self.drive.set_diff(int(self.cfg.base_fwd * 0.35), 0)
-            return "NEAR_FWD"
-        self.drive.set_diff(0, self.cfg.search_turn)
-        return default_mode
-
     def _make_red_mask(self, frame_bgr):
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         m1 = cv2.inRange(hsv, self.LOWER_RED1, self.UPPER_RED1)
@@ -714,26 +707,10 @@ class CameraGuidance:
         cx_blob, area_blob = self._largest_blob_centroid(mask)
         seen = (cx_blob is not None) and (red_ratio >= c.acquire_red_ratio)
 
-        best = None
-        best_area = 0.0
-        best_approx = None
-        for ct in contours:
-            ok, approx, area = self._is_triangle_like(ct, c.area_track_th)
-            if ok and area > best_area:
-                best = ct
-                best_area = float(area)
-                best_approx = approx
-
-        if best is None:
-            mode = self._run_fallback(red_ratio, "SEARCH")
-            self._debug_show(frame, mask, mode, red_ratio, cx_frame, best_approx)
-            return {"goal": False, "mode": mode, "red_ratio": red_ratio}
-
-        M = cv2.moments(best)
-        if M["m00"] == 0:
-            mode = self._run_fallback(red_ratio, "BAD_MOMENT")
-            self._debug_show(frame, mask, mode, red_ratio, cx_frame, best_approx)
-            return {"goal": False, "mode": mode, "red_ratio": red_ratio}
+        if seen:
+            err_px = cx_blob - cx_frame
+            self._last_seen_t = time.time()
+            self._last_err_px = int(err_px)
 
         now = time.time()
 
@@ -1150,6 +1127,225 @@ def gpio_pulse_high(pi: pigpio.pi, gpio_pin: int, sec: float):
     print(f"[GPIO] GPIO{gpio_pin} LOW")
 
 
+def drive_forward_for_seconds(drive: ServoDrive, v: float, sec: float):
+    drive.set_vw(v, 0.0)
+    print(f"[POST LANDING] forward v={v:.2f} for {sec:.1f}s")
+    time.sleep(sec)
+    drive.stop()
+
+
+# ============================================================
+# 10.5) 安全監視（転倒/スタック）
+# ============================================================
+@dataclass
+class SafetyConfig:
+    flip_deg: float = 80.0
+    flip_hold_sec: float = 0.5
+    stuck_window_sec: float = 10.0
+    stuck_min_progress_m: float = 0.5
+    stuck_v_th: float = 0.30
+
+@dataclass
+class MagCalConfig:
+    enable: bool = True
+    timeout_sec: float = 12.0
+    min_spin_sec: float = 4.0
+    spin_w: float = 0.45
+    check_hz: float = 10.0
+    target_mag_calib: int = 2
+
+
+class SafetyMonitor:
+    def __init__(self, cfg: SafetyConfig):
+        self.cfg = cfg
+        self._flip_start_t = None
+        self._dist_hist = deque()
+        self._recover_until = 0.0
+
+    def check_flip(self, pitch_deg: Optional[float], roll_deg: Optional[float]) -> bool:
+        c = self.cfg
+        if pitch_deg is None or roll_deg is None:
+            self._flip_start_t = None
+            return False
+
+        flipped = (abs(pitch_deg) >= c.flip_deg) or (abs(roll_deg) >= c.flip_deg)
+        now = time.time()
+        if flipped:
+            if self._flip_start_t is None:
+                self._flip_start_t = now
+            elif (now - self._flip_start_t) >= c.flip_hold_sec:
+                return True
+        else:
+            self._flip_start_t = None
+        return False
+
+    def update_dist(self, dist_m: Optional[float], v_cmd: Optional[float]) -> bool:
+        c = self.cfg
+        if dist_m is None:
+            return False
+
+        now = time.time()
+        self._dist_hist.append((now, float(dist_m)))
+        while self._dist_hist and (now - self._dist_hist[0][0]) > c.stuck_window_sec:
+            self._dist_hist.popleft()
+
+        if v_cmd is None or v_cmd < c.stuck_v_th or len(self._dist_hist) < 2:
+            return False
+
+        d0 = self._dist_hist[0][1]
+        d1 = self._dist_hist[-1][1]
+        return (d0 - d1) < c.stuck_min_progress_m
+
+    def recovering(self) -> bool:
+        return time.time() < self._recover_until
+
+    def start_recovery(self, sec: float = 2.0):
+        self._recover_until = time.time() + sec
+
+    def recovery_step(self, drive: ServoDrive):
+        remain = self._recover_until - time.time()
+        if remain <= 0:
+            return
+        elapsed = 2.0 - remain
+        if elapsed < 0.4:
+            drive.stop()
+        elif elapsed < 1.2:
+            drive.set_vw(-0.45, 0.0)
+        else:
+            w = 0.45 if (int(time.time()) % 2 == 0) else -0.45
+            drive.set_vw(0.0, w)
+
+
+
+
+
+def run_magnetometer_calibration(bno, drive: ServoDrive, cfg: MagCalConfig):
+    """
+    着地直後に機体を回頭させてBNO055の磁気キャリブレーションを進める。
+    calibration_status=(sys, gyro, accel, mag) の mag を監視し、
+    target値以上（かつ最小回転時間経過）で終了する。
+    """
+    if not cfg.enable:
+        return
+
+    print("[MAG CAL] start spin calibration")
+    start = time.monotonic()
+    next_check = start
+
+    while True:
+        now = time.monotonic()
+        elapsed = now - start
+        if elapsed >= cfg.timeout_sec:
+            print("[MAG CAL] timeout")
+            break
+
+        drive.set_vw(0.0, cfg.spin_w)
+
+        if now >= next_check:
+            next_check += 1.0 / cfg.check_hz
+            mag_cal = None
+            try:
+                st = bno.calibration_status
+                if st is not None and len(st) == 4:
+                    mag_cal = int(st[3])
+            except Exception:
+                mag_cal = None
+
+            if mag_cal is not None:
+                print(f"[MAG CAL] mag={mag_cal}/3 elapsed={elapsed:.1f}s")
+                if elapsed >= cfg.min_spin_sec and mag_cal >= cfg.target_mag_calib:
+                    print("[MAG CAL] target reached")
+                    break
+
+        time.sleep(0.005)
+
+    drive.stop()
+    time.sleep(0.2)
+    print("[MAG CAL] done")
+
+def _read_pitch_roll(bno):
+    e = bno.euler
+    roll = e[1] if (e is not None and e[1] is not None) else None
+    pitch = e[2] if (e is not None and e[2] is not None) else None
+    return pitch, roll
+
+
+def _apply_common_telemetry(telem: TelemetryState, phase: str, drive: ServoDrive, bme, gps_reader: NmeaGpsReader):
+    telem.phase = phase
+    telem.servo18_us = drive.last_us18
+    telem.servo12_us = drive.last_us12
+
+    try:
+        telem.temp_c = float(bme.temperature)
+        telem.press_hpa = float(bme.pressure)
+        telem.humid_pct = float(bme.humidity)
+        telem.alt_bme_m = float(bme.altitude)
+    except Exception:
+        pass
+
+    fix = gps_reader.get()
+    telem.lat = fix.lat
+    telem.lon = fix.lon
+    telem.gps_alt = fix.alt
+    telem.fixq = fix.fixq
+    telem.nsat = fix.nsat
+    telem.hdop = fix.hdop
+
+
+def _apply_gps_output_to_telemetry(telem: TelemetryState, out: dict):
+    if "dist" in out:
+        telem.dist_to_goal_m = out.get("dist")
+        telem.bearing_goal_deg = out.get("bearing_goal")
+        telem.heading_deg = out.get("heading")
+        telem.err_deg = out.get("err")
+        telem.v_cmd = out.get("v")
+        telem.w_cmd = out.get("w")
+
+
+def _publish_record_if_due(now2: float, next_record: float, log_hz: float, telem: TelemetryState, fmt: TelemetryFormatter,
+                           logging_enabled: bool, log_f, record_lock: threading.Lock, record_line_ref: dict):
+    if now2 >= next_record:
+        next_record += 1.0 / log_hz
+
+        telem.seq += 1
+        t_ms = int(now2 * 1000)
+        line = fmt.format_line(t_ms, telem)
+
+        if logging_enabled:
+            try:
+                log_f.write(line + "\n")
+            except Exception as e:
+                print("[PI LOG] write error:", e)
+
+        with record_lock:
+            record_line_ref["line"] = line
+            record_line_ref["updated_t"] = now2
+
+    return next_record
+
+
+def _send_twelite_if_due(now2: float, next_tw_send: float, tw_send_hz: float, record_lock: threading.Lock,
+                         record_line_ref: dict, tw: TweliteSoftUART):
+    if now2 >= next_tw_send:
+        next_tw_send += 1.0 / tw_send_hz
+        with record_lock:
+            line = record_line_ref.get("line", "")
+
+        if line:
+            try:
+                tw.write_line(line)
+            except Exception as e:
+                print("[TW] send error:", e)
+
+        try:
+            for r in tw.read_lines():
+                if r:
+                    print("[TW RX]", r)
+        except Exception:
+            pass
+
+    return next_tw_send
+
 # ============================================================
 # 10.5) 安全監視（転倒/スタック）
 # ============================================================
@@ -1298,9 +1494,12 @@ def main():
     gps_guidance = GpsGuidance(gps_cfg, drive, bno, gps_reader)
     cam_guidance = CameraGuidance(cam_cfg, drive)
     safety = SafetyMonitor(SafetyConfig())
+    mag_cal_cfg = MagCalConfig(enable=True, timeout_sec=12.0, min_spin_sec=4.0, spin_w=0.45)
 
     mission_t0 = None
     FORCE_GOAL_SEC = 19 * 60
+    POST_LANDING_FWD_SEC = 3.0
+    POST_LANDING_FWD_V = 0.45
 
     # -------------------------
     # Telemetry/log record pipeline
@@ -1420,6 +1619,8 @@ def main():
                         mission_t0 = time.time()
                     print("[DROP] LANDING CONFIRMED")
                     gpio_pulse_high(pi, GPIO_LANDING_PIN, 1.0)
+                    drive_forward_for_seconds(drive, POST_LANDING_FWD_V, POST_LANDING_FWD_SEC)
+                    run_magnetometer_calibration(bno, drive, mag_cal_cfg)
 
                     phase = Phase.GPS
                     print(f"Phase: {phase}")
@@ -1431,9 +1632,7 @@ def main():
                 dt = 1.0 / gps_cfg.control_hz
                 t0 = time.monotonic()
 
-                e = bno.euler
-                roll = e[1] if (e is not None and e[1] is not None) else None
-                pitch = e[2] if (e is not None and e[2] is not None) else None
+                pitch, roll = _read_pitch_roll(bno)
                 if safety.check_flip(pitch, roll):
                     print("[SAFETY] FLIP detected -> STOP")
                     drive.stop()
@@ -1442,13 +1641,14 @@ def main():
 
                 out = gps_guidance.step()
 
-                if "dist" in out:
-                    telem.dist_to_goal_m = out.get("dist")
-                    telem.bearing_goal_deg = out.get("bearing_goal")
-                    telem.heading_deg = out.get("heading")
-                    telem.err_deg = out.get("err")
-                    telem.v_cmd = out.get("v")
-                    telem.w_cmd = out.get("w")
+                _apply_gps_output_to_telemetry(telem, out)
+
+                if safety.recovering():
+                    safety.recovery_step(drive)
+                else:
+                    if safety.update_dist(out.get("dist"), out.get("v")):
+                        print("[SAFETY] STUCK suspected -> recovery")
+                        safety.start_recovery(sec=2.0)
 
                 if safety.recovering():
                     safety.recovery_step(drive)
@@ -1464,9 +1664,7 @@ def main():
                 time.sleep(max(0.0, dt - (time.monotonic() - t0)))
 
             elif phase == Phase.CAMERA:
-                e = bno.euler
-                roll = e[1] if (e is not None and e[1] is not None) else None
-                pitch = e[2] if (e is not None and e[2] is not None) else None
+                pitch, roll = _read_pitch_roll(bno)
                 if safety.check_flip(pitch, roll):
                     print("[SAFETY] FLIP detected -> STOP")
                     drive.stop()
