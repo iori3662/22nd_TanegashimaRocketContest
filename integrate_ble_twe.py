@@ -73,11 +73,7 @@ def clamp_int(x, lo, hi):
     return int(max(lo, min(hi, int(x))))
 
 def wrap_to_180(a_deg):
-    while a_deg > 180:
-        a_deg -= 360
-    while a_deg < -180:
-        a_deg += 360
-    return a_deg
+    return ((a_deg + 180) % 360) - 180
 
 def norm3(v):
     if v is None:
@@ -85,7 +81,7 @@ def norm3(v):
     x, y, z = v
     if x is None or y is None or z is None:
         return None
-    return math.sqrt(x * x + y * y + z * z)
+    return math.hypot(x, y, z)
 
 def median_or_none(buf: deque):
     if len(buf) < buf.maxlen:
@@ -697,10 +693,11 @@ class CameraGuidance:
         mask = self._make_red_mask(frame)
         red_ratio = cv2.countNonZero(mask) / float(h * w)
 
+        now = time.time()
         if red_ratio >= c.goal_red_ratio:
             if self._goal_start_t is None:
-                self._goal_start_t = time.time()
-            elif (time.time() - self._goal_start_t) >= c.goal_hold_sec:
+                self._goal_start_t = now
+            elif (now - self._goal_start_t) >= c.goal_hold_sec:
                 self.drive.stop()
                 self.state = "GOAL"
                 return {"goal": True, "mode": "GOAL", "red_ratio": red_ratio}
@@ -1033,7 +1030,7 @@ class BleWorker(threading.Thread):
 
     async def _runner(self):
         # notify callback（XIAO->Pi）
-        async def on_notify(_, data: bytearray):
+        def on_notify(_, data: bytearray):
             try:
                 s = data.decode("utf-8", errors="ignore").strip()
             except Exception:
@@ -1350,6 +1347,79 @@ def _send_twelite_if_due(now2: float, next_tw_send: float, tw_send_hz: float, re
     return next_tw_send
 
 # ============================================================
+# 10.5) 安全監視（転倒/スタック）
+# ============================================================
+@dataclass
+class SafetyConfig:
+    flip_deg: float = 80.0
+    flip_hold_sec: float = 0.5
+    stuck_window_sec: float = 10.0
+    stuck_min_progress_m: float = 0.5
+    stuck_v_th: float = 0.30
+
+
+class SafetyMonitor:
+    def __init__(self, cfg: SafetyConfig):
+        self.cfg = cfg
+        self._flip_start_t = None
+        self._dist_hist = deque()
+        self._recover_until = 0.0
+
+    def check_flip(self, pitch_deg: Optional[float], roll_deg: Optional[float]) -> bool:
+        c = self.cfg
+        if pitch_deg is None or roll_deg is None:
+            self._flip_start_t = None
+            return False
+
+        flipped = (abs(pitch_deg) >= c.flip_deg) or (abs(roll_deg) >= c.flip_deg)
+        now = time.time()
+        if flipped:
+            if self._flip_start_t is None:
+                self._flip_start_t = now
+            elif (now - self._flip_start_t) >= c.flip_hold_sec:
+                return True
+        else:
+            self._flip_start_t = None
+        return False
+
+    def update_dist(self, dist_m: Optional[float], v_cmd: Optional[float]) -> bool:
+        c = self.cfg
+        if dist_m is None:
+            return False
+
+        now = time.time()
+        self._dist_hist.append((now, float(dist_m)))
+        while self._dist_hist and (now - self._dist_hist[0][0]) > c.stuck_window_sec:
+            self._dist_hist.popleft()
+
+        if v_cmd is None or v_cmd < c.stuck_v_th or len(self._dist_hist) < 2:
+            return False
+
+        d0 = self._dist_hist[0][1]
+        d1 = self._dist_hist[-1][1]
+        return (d0 - d1) < c.stuck_min_progress_m
+
+    def recovering(self) -> bool:
+        return time.time() < self._recover_until
+
+    def start_recovery(self, sec: float = 2.0):
+        self._recover_until = time.time() + sec
+
+    def recovery_step(self, drive: ServoDrive):
+        remain = self._recover_until - time.time()
+        if remain <= 0:
+            return
+        elapsed = 2.0 - remain
+        if elapsed < 0.4:
+            drive.stop()
+        elif elapsed < 1.2:
+            drive.set_vw(-0.45, 0.0)
+        else:
+            w = 0.45 if (int(time.time()) % 2 == 0) else -0.45
+            drive.set_vw(0.0, w)
+
+
+# ============================================================
 # 11) メイン
 # ============================================================
 def main():
@@ -1572,6 +1642,13 @@ def main():
                 out = gps_guidance.step()
 
                 _apply_gps_output_to_telemetry(telem, out)
+
+                if safety.recovering():
+                    safety.recovery_step(drive)
+                else:
+                    if safety.update_dist(out.get("dist"), out.get("v")):
+                        print("[SAFETY] STUCK suspected -> recovery")
+                        safety.start_recovery(sec=2.0)
 
                 if safety.recovering():
                     safety.recovery_step(drive)
