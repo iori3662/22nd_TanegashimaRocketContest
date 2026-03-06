@@ -1,0 +1,8 @@
+=== Calibration result ===
+offset_x = 16.437500
+offset_y = 10.437500
+radius_x = 55.312500
+radius_y = 52.937500
+scale_x = 0.978531
+scale_y = 1.022432
+ellipse_ratio_before = 1.044864
