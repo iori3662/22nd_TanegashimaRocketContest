@@ -1,0 +1,6 @@
+t_iso,phase,calib,flip,stuck,mission_done,done_reason,lat,lon,dist_m,goal_deg,head_deg,err_deg,cmd_v,cmd_turn,nsat,hdop,red_ratio
+2026-03-06T18:35:18,DROP,0,0,0,0,RUNNING,,,,,,,0.000000,0.000000,0,,
+2026-03-06T18:35:19,DROP,0,0,0,0,RUNNING,,,,,,,0.000000,0.000000,0,,
+2026-03-06T18:35:21,DROP,0,0,0,0,RUNNING,,,,,,,0.000000,0.000000,0,,
+2026-03-06T18:35:23,CALIB,0,0,0,0,RUNNING,,,,,,,0.000000,0.000000,0,,
+2026-03-06T18:35:30,DONE,0,0,0,1,KEYBOARD_INTERRUPT,,,,,,,0.000000,0.000000,0,,
