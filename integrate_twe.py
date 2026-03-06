@@ -794,7 +794,7 @@ TWE_RX_GPIO = 14
 TWE_TX_GPIO = 15
 DATA_BITS = 8
 STOP_BITS = 1
-
+RX_BUF_MAX = 2048
 
 class SoftUartTwelite:
     def __init__(self, pi: pigpio.pi, tx_gpio: int, rx_gpio: int, baud: int):
@@ -802,10 +802,13 @@ class SoftUartTwelite:
         self.tx = tx_gpio
         self.rx = rx_gpio
         self.baud = baud
+        self._rx_buf = b""
 
+        # TX idle high
         self.pi.set_mode(self.tx, pigpio.OUTPUT)
         self.pi.write(self.tx, 1)
 
+        # RX open
         self.pi.set_mode(self.rx, pigpio.INPUT)
         self.pi.bb_serial_read_open(self.rx, self.baud, DATA_BITS)
         time.sleep(0.05)
@@ -816,24 +819,12 @@ class SoftUartTwelite:
         except pigpio.error:
             pass
 
-    def send_line(self, s):
-        if s is None:
-            s = ""
-
-        if isinstance(s, (bytes, bytearray)):
-            payload = bytes(s)
-        else:
-            payload = str(s).strip().encode("ascii", errors="ignore")
-
-        payload += b"\r\n"
+    def send_line(self, s: str):
+        # 元の動作実績のある形をそのまま使う
+        b = (str(s).strip() + "\r\n").encode("ascii", errors="ignore")
 
         self.pi.wave_clear()
-
-        try:
-            self.pi.wave_add_serial(self.tx, self.baud, DATA_BITS, STOP_BITS, 0, payload)
-        except TypeError:
-            self.pi.wave_add_serial(self.tx, self.baud, DATA_BITS, STOP_BITS, payload)
-
+        self.pi.wave_add_serial(self.tx, self.baud, DATA_BITS, STOP_BITS, 0, b)
         wid = self.pi.wave_create()
         if wid < 0:
             raise RuntimeError("wave_create failed")
@@ -844,11 +835,28 @@ class SoftUartTwelite:
 
         self.pi.wave_delete(wid)
 
+    def read_lines(self):
+        cnt, data = self.pi.bb_serial_read(self.rx)
+        if cnt > 0 and data:
+            self._rx_buf += data
+            if len(self._rx_buf) > RX_BUF_MAX:
+                self._rx_buf = self._rx_buf[-RX_BUF_MAX:]
+
+        lines = []
+        while b"\n" in self._rx_buf:
+            line, self._rx_buf = self._rx_buf.split(b"\n", 1)
+            line = line.rstrip(b"\r")
+            try:
+                lines.append(line.decode("ascii", errors="replace").strip())
+            except Exception:
+                lines.append("")
+        return lines
+
 
 # ============================================================
 # 9) ダウンリンク + CSV
 # ============================================================
-DOWNLINK_HZ = 1.0
+DOWNLINK_HZ = 0.2
 
 DL_FIELDS = [
     "t_iso", "phase", "calib", "flip", "stuck", "mission_done", "done_reason",
@@ -982,6 +990,8 @@ def main():
     picam2 = None
 
     tw = SoftUartTwelite(pi, tx_gpio=TWE_TX_GPIO, rx_gpio=TWE_RX_GPIO, baud=BAUD)
+    tw.send_line("TEST,HELLO,123")
+    print("TWE test sent")
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = f"./logs/cansat_{ts}.csv"
     dl = DownlinkCsvLogger(tw, csv_path, logger=print)
