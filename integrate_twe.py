@@ -769,7 +769,6 @@ class SoftUartTwelite:
         self.pi.set_mode(self.tx, pigpio.OUTPUT)
         self.pi.write(self.tx, 1)
 
-        # 受信は今回は未使用だがopenしておく（将来拡張）
         self.pi.set_mode(self.rx, pigpio.INPUT)
         self.pi.bb_serial_read_open(self.rx, self.baud, DATA_BITS)
         time.sleep(0.05)
@@ -780,16 +779,39 @@ class SoftUartTwelite:
         except pigpio.error:
             pass
 
-    def send_line(self, s: str):
-        b = (s.strip() + "\r\n").encode("ascii", errors="ignore")
+    def send_line(self, s):
+        """
+        何が来ても安全に bytes(CRLF付き) にして送る
+        - int/float/None → 文字列化
+        - bytes/bytearray → そのまま
+        """
+        if s is None:
+            s = ""
+        if isinstance(s, (bytes, bytearray)):
+            payload = bytes(s)
+        else:
+            payload = str(s).strip().encode("ascii", errors="ignore")
+
+        payload += b"\r\n"
+
         self.pi.wave_clear()
-        self.pi.wave_add_serial(self.tx, self.baud, DATA_BITS, STOP_BITS, 0, b)
+
+        # pigpio の版によって offset 引数の有無があるので両対応
+        try:
+            # 新しめ: (gpio, baud, data_bits, stop_bits, offset, data)
+            self.pi.wave_add_serial(self.tx, self.baud, DATA_BITS, STOP_BITS, 0, payload)
+        except TypeError:
+            # 古め: (gpio, baud, data_bits, stop_bits, data)
+            self.pi.wave_add_serial(self.tx, self.baud, DATA_BITS, STOP_BITS, payload)
+
         wid = self.pi.wave_create()
         if wid < 0:
             raise RuntimeError("wave_create failed")
+
         self.pi.wave_send_once(wid)
         while self.pi.wave_tx_busy():
             time.sleep(0.001)
+
         self.pi.wave_delete(wid)
 
 
@@ -1028,6 +1050,7 @@ def main():
 
                     "red_ratio": cam_guidance.last_red_ratio if phase == Phase.CAMERA else None,
                 }
+                print("[DLDBG]", type(line), line if isinstance(line, str) else repr(line))
                 dl.emit(row)
 
                 # 1Hzフラグは送信後にクリア（瞬間イベントとして扱う）
