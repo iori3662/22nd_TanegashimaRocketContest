@@ -1,301 +1,230 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import time
 import math
 import json
-import time
 import pigpio
 import board
+import busio
 import adafruit_bno055
 
-# =========================
+# =========================================
 # 設定
-# =========================
-SERVO_R = 18   # GPIO18 右サーボ
-SERVO_L = 12   # GPIO12 左サーボ
+# =========================================
+SERVO_RIGHT_PIN = 18   # GPIO18 右サーボ
+SERVO_LEFT_PIN  = 12   # GPIO12 左サーボ
 
-STOP = 1490
+STOP_RIGHT = 1490
+STOP_LEFT  = 1490
 
-# 必要に応じて微調整してください
-FWD_R = 1000
-FWD_L = 2000
-SPIN_LEFT_R = 1000
-SPIN_LEFT_L = 1000
-SPIN_RIGHT_R = 2000
-SPIN_RIGHT_L = 2000
+# その場旋回（右回り）
+SPIN_R_RIGHT = 2000
+SPIN_R_LEFT  = 2000
 
-CAL_FILE = "bno055_mag_cal.json"
-DECLINATION_DEG = 0.0   # 磁北→真北補正。必要なら後で設定
-USE_EXTERNAL_CRYSTAL = True
+# その場旋回（左回り）
+SPIN_L_RIGHT = 1000
+SPIN_L_LEFT  = 1000
 
-# BNO055 内部キャリブレーションの目標
-TARGET_SYS = 3
-TARGET_GYRO = 3
-TARGET_ACCEL = 3
-TARGET_MAG = 3
+CALIBRATION_TIME_SEC = 12.0   # 旋回しながらデータ取得する時間
+SAMPLE_INTERVAL_SEC  = 0.05   # 20 Hz程度
+SETTLE_TIME_SEC      = 1.0    # 開始前安定待ち
+SAVE_FILE = "mag_offset_bno055.json"
 
-# 自動キャリブレーション全体の最大時間[s]
-AUTO_CAL_TIMEOUT = 40.0
+# =========================================
+# ヘルパ
+# =========================================
+def safe_stop_servos(pi):
+    pi.set_servo_pulsewidth(SERVO_RIGHT_PIN, STOP_RIGHT)
+    pi.set_servo_pulsewidth(SERVO_LEFT_PIN,  STOP_LEFT)
 
-# =========================
-# 初期化
-# =========================
-pi = pigpio.pi()
-if not pi.connected:
-    raise RuntimeError("pigpio に接続できません。pigpiod を確認してください。")
+def free_servos(pi):
+    pi.set_servo_pulsewidth(SERVO_RIGHT_PIN, 0)
+    pi.set_servo_pulsewidth(SERVO_LEFT_PIN,  0)
 
-i2c = board.I2C()
-bno = adafruit_bno055.BNO055_I2C(i2c)
-
-time.sleep(1.0)
-
-try:
-    bno.use_external_crystal = USE_EXTERNAL_CRYSTAL
-    time.sleep(0.5)
-except Exception:
-    pass
-
-# =========================
-# サーボ関数
-# =========================
-def servo_stop():
-    pi.set_servo_pulsewidth(SERVO_R, STOP)
-    pi.set_servo_pulsewidth(SERVO_L, STOP)
-
-def servo_free():
-    pi.set_servo_pulsewidth(SERVO_R, 0)
-    pi.set_servo_pulsewidth(SERVO_L, 0)
-
-def forward():
-    pi.set_servo_pulsewidth(SERVO_R, FWD_R)
-    pi.set_servo_pulsewidth(SERVO_L, FWD_L)
-
-def spin_left():
-    pi.set_servo_pulsewidth(SERVO_R, SPIN_LEFT_R)
-    pi.set_servo_pulsewidth(SERVO_L, SPIN_LEFT_L)
-
-def spin_right():
-    pi.set_servo_pulsewidth(SERVO_R, SPIN_RIGHT_R)
-    pi.set_servo_pulsewidth(SERVO_L, SPIN_RIGHT_L)
-
-# =========================
-# 磁気 min/max 収集
-# =========================
-mag_min = [float("inf"), float("inf"), float("inf")]
-mag_max = [float("-inf"), float("-inf"), float("-inf")]
-
-def update_mag_minmax():
-    mag = bno.magnetic
+def get_mag_xy(sensor):
+    """
+    BNO055の磁気センサ値を読む。
+    戻り値: (mx, my)
+    読めないときは (None, None)
+    """
+    mag = sensor.magnetic
     if mag is None:
-        return False
+        return None, None
 
-    if any(v is None for v in mag):
-        return False
+    mx, my, mz = mag
+    if mx is None or my is None:
+        return None, None
 
-    for i in range(3):
-        mag_min[i] = min(mag_min[i], mag[i])
-        mag_max[i] = max(mag_max[i], mag[i])
-    return True
+    return float(mx), float(my)
 
-def calc_mag_offset_scale():
-    offset = [(mag_max[i] + mag_min[i]) / 2.0 for i in range(3)]
-    scale = [(mag_max[i] - mag_min[i]) / 2.0 for i in range(3)]
-    return offset, scale
+def heading_deg_from_xy(mx, my):
+    """
+    atan2で 0〜360 deg に正規化
+    """
+    deg = math.degrees(math.atan2(my, mx))
+    if deg < 0:
+        deg += 360.0
+    return deg
 
-def save_mag_calibration(path=CAL_FILE):
-    offset, scale = calc_mag_offset_scale()
+def save_offsets(offset_x, offset_y, radius_x=None, radius_y=None):
     data = {
-        "mag_min": mag_min,
-        "mag_max": mag_max,
-        "offset": offset,
-        "scale": scale,
-        "declination_deg": DECLINATION_DEG,
+        "offset_x": offset_x,
+        "offset_y": offset_y,
+        "radius_x": radius_x,
+        "radius_y": radius_y,
+        "saved_at_unix": time.time(),
     }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    return data
+    with open(SAVE_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def load_mag_calibration(path=CAL_FILE):
-    with open(path, "r", encoding="utf-8") as f:
+def load_offsets():
+    with open(SAVE_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# =========================
-# BNO055 内部キャリブレーション状態
-# =========================
-def get_cal_status():
-    # (sys, gyro, accel, mag)
-    return bno.calibration_status
-
-def is_calibrated_enough():
-    sys_c, gyro_c, accel_c, mag_c = get_cal_status()
-    return (
-        sys_c >= TARGET_SYS and
-        gyro_c >= TARGET_GYRO and
-        accel_c >= TARGET_ACCEL and
-        mag_c >= TARGET_MAG
-    )
-
-# =========================
-# heading 計算
-# =========================
-def normalize_deg(angle_deg):
-    angle_deg = angle_deg % 360.0
-    if angle_deg < 0:
-        angle_deg += 360.0
-    return angle_deg
-
-def heading_from_bno055_fusion():
+# =========================================
+# キャリブレーション本体
+# =========================================
+def calibrate_mag_by_spin(sensor, pi, spin_direction="right"):
     """
-    BNO055 のセンサフュージョン結果から方位を取得
-    通常は euler[0] が heading
+    Qiita記事の簡易補正法をBNO055向けに移植したもの。
+    x, y の最大値・最小値からオフセットを取る。
     """
-    euler = bno.euler
-    if euler is None or euler[0] is None:
-        return None
-    return normalize_deg(float(euler[0]))
+    print("=== Magnetometer manual calibration start ===")
+    print("機体を床に置き、周囲の鉄・磁石・工具・PC・電源からできるだけ離してください。")
+    print(f"{SETTLE_TIME_SEC:.1f}秒待機後、その場旋回しながら磁気データを収集します。")
+    time.sleep(SETTLE_TIME_SEC)
 
-def heading_from_mag_with_offset(offset_xyz, declination_deg=0.0):
-    """
-    自前補正版:
-    磁気 x,y から atan2 で heading を計算
-    """
-    mag = bno.magnetic
-    if mag is None or mag[0] is None or mag[1] is None:
-        return None
+    if spin_direction == "right":
+        pi.set_servo_pulsewidth(SERVO_RIGHT_PIN, SPIN_R_RIGHT)
+        pi.set_servo_pulsewidth(SERVO_LEFT_PIN,  SPIN_R_LEFT)
+        print("右旋回でキャリブレーション中...")
+    else:
+        pi.set_servo_pulsewidth(SERVO_RIGHT_PIN, SPIN_L_RIGHT)
+        pi.set_servo_pulsewidth(SERVO_LEFT_PIN,  SPIN_L_LEFT)
+        print("左旋回でキャリブレーション中...")
 
-    mx = mag[0] - offset_xyz[0]
-    my = mag[1] - offset_xyz[1]
+    start = time.monotonic()
+    max_x = None
+    min_x = None
+    max_y = None
+    min_y = None
+    samples = 0
 
-    # ここはセンサ搭載向きに依存
-    # 一般的な平面上の簡易式として atan2(my, mx) を採用
-    heading_deg = math.degrees(math.atan2(my, mx))
-    heading_deg += declination_deg
-    return normalize_deg(heading_deg)
+    try:
+        while (time.monotonic() - start) < CALIBRATION_TIME_SEC:
+            mx, my = get_mag_xy(sensor)
+            if mx is not None and my is not None:
+                if max_x is None:
+                    max_x = min_x = mx
+                    max_y = min_y = my
+                else:
+                    max_x = max(max_x, mx)
+                    min_x = min(min_x, mx)
+                    max_y = max(max_y, my)
+                    min_y = min(min_y, my)
+                samples += 1
 
-# =========================
-# 自動キャリブレーション動作
-# =========================
-def run_motion_with_sampling(motion_func, duration_s, label):
-    print(f"[MOTION] {label} for {duration_s:.1f}s")
-    motion_func()
+                print(
+                    f"\rraw=({mx:8.3f}, {my:8.3f})  "
+                    f"x[min,max]=({min_x:8.3f}, {max_x:8.3f})  "
+                    f"y[min,max]=({min_y:8.3f}, {max_y:8.3f})  "
+                    f"samples={samples}",
+                    end=""
+                )
+
+            time.sleep(SAMPLE_INTERVAL_SEC)
+
+    finally:
+        print()
+        safe_stop_servos(pi)
+        time.sleep(1.0)
+
+    if samples < 20:
+        raise RuntimeError("有効サンプルが少なすぎます。BNO055の磁気値が安定して取得できていません。")
+
+    offset_x = (max_x + min_x) / 2.0
+    offset_y = (max_y + min_y) / 2.0
+    radius_x = (max_x - min_x) / 2.0
+    radius_y = (max_y - min_y) / 2.0
+
+    print("=== Calibration result ===")
+    print(f"offset_x = {offset_x:.6f}")
+    print(f"offset_y = {offset_y:.6f}")
+    print(f"radius_x = {radius_x:.6f}")
+    print(f"radius_y = {radius_y:.6f}")
+
+    # 楕円の強さを簡易チェック
+    if radius_x > 0 and radius_y > 0:
+        ratio = max(radius_x, radius_y) / min(radius_x, radius_y)
+        print(f"ellipse_ratio = {ratio:.3f}")
+        if ratio > 1.3:
+            print("警告: x/yの振れ幅差が大きいです。")
+            print("      オフセット補正だけでは不十分で、周囲金属やモータ磁場の影響が強い可能性があります。")
+
+    save_offsets(offset_x, offset_y, radius_x, radius_y)
+    print(f"補正値を {SAVE_FILE} に保存しました。")
+
+    return offset_x, offset_y
+
+# =========================================
+# 確認表示
+# =========================================
+def monitor_heading(sensor, offset_x, offset_y, duration_sec=20.0):
+    print("=== Corrected heading monitor ===")
+    print("Ctrl+C で終了できます。")
     start = time.monotonic()
 
-    while (time.monotonic() - start) < duration_s:
-        update_mag_minmax()
-        sys_c, gyro_c, accel_c, mag_c = get_cal_status()
-        print(
-            f"  CAL sys={sys_c} gyro={gyro_c} accel={accel_c} mag={mag_c}",
-            end="\r",
-            flush=True,
-        )
-        time.sleep(0.05)
+    while (time.monotonic() - start) < duration_sec:
+        mx, my = get_mag_xy(sensor)
+        if mx is None or my is None:
+            print("mag read failed")
+            time.sleep(0.1)
+            continue
 
-    servo_stop()
-    print()
-    time.sleep(0.8)
-
-def auto_calibrate():
-    """
-    CanSat を動かして
-    - BNO055 内部キャリブレーションを進める
-    - 磁気 min/max 収集
-    """
-    print("=== AUTO CALIBRATION START ===")
-    print("内部キャリブレーションと磁気 min/max 収集を同時に行います。")
-
-    t0 = time.monotonic()
-
-    while True:
-        if is_calibrated_enough():
-            print("[OK] BNO055 内部キャリブレーション目標に到達しました。")
-            break
-
-        elapsed = time.monotonic() - t0
-        if elapsed > AUTO_CAL_TIMEOUT:
-            print("[WARN] タイムアウト。現時点の結果で終了します。")
-            break
-
-        # その場旋回を中心に実施
-        run_motion_with_sampling(spin_left, 4.0, "spin_left")
-        if is_calibrated_enough():
-            break
-
-        run_motion_with_sampling(spin_right, 4.0, "spin_right")
-        if is_calibrated_enough():
-            break
-
-        # 少し前進して姿勢・周囲磁場の向き変化を増やす
-        run_motion_with_sampling(forward, 2.0, "forward")
-        if is_calibrated_enough():
-            break
-
-    servo_stop()
-    time.sleep(1.0)
-
-    saved = save_mag_calibration()
-    print("[SAVE] 磁気補正値を保存しました:", CAL_FILE)
-    print("  mag_min =", saved["mag_min"])
-    print("  mag_max =", saved["mag_max"])
-    print("  offset  =", saved["offset"])
-    print("  scale   =", saved["scale"])
-    print("=== AUTO CALIBRATION END ===")
-
-# =========================
-# 方位監視
-# =========================
-def monitor_heading(duration_s=None, print_hz=5.0):
-    """
-    2種類の方位を表示する:
-    1) BNO055 フュージョン方位
-    2) 自前磁気補正方位
-    """
-    cal = load_mag_calibration(CAL_FILE)
-    offset = cal["offset"]
-    decl = float(cal.get("declination_deg", 0.0))
-
-    dt = 1.0 / print_hz
-    t0 = time.monotonic()
-
-    print("=== HEADING MONITOR START ===")
-    while True:
-        now = time.monotonic()
-        if duration_s is not None and (now - t0) > duration_s:
-            break
-
-        sys_c, gyro_c, accel_c, mag_c = get_cal_status()
-        fusion_heading = heading_from_bno055_fusion()
-        mag_heading = heading_from_mag_with_offset(offset, decl)
+        cx = mx - offset_x
+        cy = my - offset_y
+        hdg = heading_deg_from_xy(cx, cy)
 
         print(
-            f"CAL(sys,gyro,accel,mag)=({sys_c},{gyro_c},{accel_c},{mag_c}) | "
-            f"fusion_heading={fusion_heading!s:>8} deg | "
-            f"mag_heading={mag_heading!s:>8} deg"
+            f"raw=({mx:8.3f}, {my:8.3f})  "
+            f"corr=({cx:8.3f}, {cy:8.3f})  "
+            f"heading={hdg:7.2f} deg"
         )
-        time.sleep(dt)
+        time.sleep(0.1)
 
-    print("=== HEADING MONITOR END ===")
-
-# =========================
-# メイン
-# =========================
+# =========================================
+# main
+# =========================================
 def main():
+    # pigpio
+    pi = pigpio.pi()
+    if not pi.connected:
+        raise RuntimeError("pigpio daemon に接続できません。sudo pigpiod を確認してください。")
+
+    # BNO055
+    i2c = busio.I2C(board.SCL, board.SDA)
+    sensor = adafruit_bno055.BNO055_I2C(i2c, address=0x28)
+
     try:
-        servo_stop()
-        time.sleep(2.0)
+        # 念のため停止
+        safe_stop_servos(pi)
+        print("Stopping servos...")
+        time.sleep(2)
 
-        # 1. 自動キャリブレーション
-        auto_calibrate()
+        # キャリブレーション実行
+        offset_x, offset_y = calibrate_mag_by_spin(sensor, pi, spin_direction="right")
 
-        # 2. 停止状態で方位確認
-        #    必要なら duration_s=None で無限監視にしてもOK
-        monitor_heading(duration_s=30.0, print_hz=5.0)
+        # 確認表示
+        monitor_heading(sensor, offset_x, offset_y, duration_sec=20.0)
 
     except KeyboardInterrupt:
-        print("\n[EXIT] KeyboardInterrupt")
+        print("\nInterrupted by user.")
+
     finally:
-        servo_stop()
+        safe_stop_servos(pi)
         time.sleep(0.5)
-        servo_free()
+        free_servos(pi)
         pi.stop()
         print("Finish")
 
