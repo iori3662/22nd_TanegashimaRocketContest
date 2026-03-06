@@ -819,21 +819,31 @@ class SoftUartTwelite:
         except pigpio.error:
             pass
 
-    def send_line(self, s: str):
-        # 元の動作実績のある形をそのまま使う
-        b = (str(s).strip() + "\r\n").encode("ascii", errors="ignore")
+def send_line(self, s: str):
+    b = (str(s).strip() + "\r\n").encode("ascii", errors="ignore")
 
-        self.pi.wave_clear()
-        self.pi.wave_add_serial(self.tx, self.baud, DATA_BITS, STOP_BITS, 0, b)
-        wid = self.pi.wave_create()
-        if wid < 0:
-            raise RuntimeError("wave_create failed")
+    self.pi.wave_clear()
 
-        self.pi.wave_send_once(wid)
-        while self.pi.wave_tx_busy():
-            time.sleep(0.001)
+    # Python版 pigpio の正しい引数順
+    # wave_add_serial(user_gpio, baud, data, offset=0, bb_bits=8, bb_stop=2)
+    self.pi.wave_add_serial(
+        self.tx,
+        self.baud,
+        b,
+        0,
+        DATA_BITS,
+        STOP_BITS
+    )
 
-        self.pi.wave_delete(wid)
+    wid = self.pi.wave_create()
+    if wid < 0:
+        raise RuntimeError("wave_create failed")
+
+    self.pi.wave_send_once(wid)
+    while self.pi.wave_tx_busy():
+        time.sleep(0.001)
+
+    self.pi.wave_delete(wid)
 
     def read_lines(self):
         cnt, data = self.pi.bb_serial_read(self.rx)
