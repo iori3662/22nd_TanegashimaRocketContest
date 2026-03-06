@@ -1,459 +1,380 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import csv
-import json
+"""
+BNO055 磁気センサ 簡易キャリブレーション
+- Qiita記事の max/min 中心補正をベース
+- さらに簡易的な楕円補正(2Dスケール補正)も追加
+- pigpioでCanSatをその場旋回させながらデータ取得可能
+- 補正前/補正後グラフを保存
+- CSV保存
+
+前提:
+  sudo pigpiod
+  pip install adafruit-circuitpython-bno055 matplotlib numpy
+
+注意:
+  1) サーボ通電中は磁気外乱が増える可能性あり
+  2) 本当に方位精度を上げたいなら、まずは手回し校正で確認すること
+  3) このコードは「水平面上の x-y 磁気」前提の2D補正
+"""
+
 import time
+import csv
 import math
-import statistics
-from datetime import datetime
+from pathlib import Path
 
 import pigpio
 import board
 import busio
 import adafruit_bno055
 
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")   # headless用
+import matplotlib.pyplot as plt
+
 
 # =========================================
-# ユーザ設定
+# 設定
 # =========================================
-SERVO_RIGHT_PIN = 18   # GPIO18 右サーボ
-SERVO_LEFT_PIN  = 12   # GPIO12 左サーボ
+SERVO1_PIN = 18   # 右サーボ
+SERVO2_PIN = 12   # 左サーボ
 
-STOP_RIGHT = 1490
-STOP_LEFT  = 1490
+STOP_PW = 1490
+FWD_R_PW = 1000
+FWD_L_PW = 2000
 
-# その場旋回（必要に応じて調整）
-SPIN_RIGHT_RIGHT = 2000
-SPIN_RIGHT_LEFT  = 2000
+LEFT_SPIN_R_PW = 1000
+LEFT_SPIN_L_PW = 1000
 
-SPIN_LEFT_RIGHT = 1000
-SPIN_LEFT_LEFT  = 1000
+RIGHT_SPIN_R_PW = 2000
+RIGHT_SPIN_L_PW = 2000
 
-BNO055_ADDR = 0x28
+OUTDIR = Path("./bno055_mag_calib")
+OUTDIR.mkdir(exist_ok=True)
 
-CALIBRATION_TIME_SEC = 20.0   # 平面上で旋回してデータ収集
-STATIC_BEFORE_SEC    = 5.0    # キャリブレーション前の静止ログ
-STATIC_AFTER_SEC     = 5.0    # キャリブレーション後の静止ログ
-SAMPLE_INTERVAL_SEC  = 0.05   # 20Hz
+# 取得設定
+SAMPLE_HZ = 10.0
+CALIB_SECONDS = 20.0
 
-OUTPUT_DIR = "mag_cal_logs"
+# 自動旋回するか
+AUTO_SPIN = True
+
+# 旋回方向
+SPIN_DIRECTION = "left"   # "left" or "right"
+
+# 開始前停止時間
+PRE_STOP_SEC = 2.0
+
+# 旋回後停止時間
+POST_STOP_SEC = 1.0
+
+# 外れ値対策
+REJECT_NONE_OR_ZERO = True
 
 
 # =========================================
 # サーボ制御
 # =========================================
-def safe_stop_servos(pi):
-    pi.set_servo_pulsewidth(SERVO_RIGHT_PIN, STOP_RIGHT)
-    pi.set_servo_pulsewidth(SERVO_LEFT_PIN,  STOP_LEFT)
-
-def free_servos(pi):
-    pi.set_servo_pulsewidth(SERVO_RIGHT_PIN, 0)
-    pi.set_servo_pulsewidth(SERVO_LEFT_PIN,  0)
-
-def spin_right(pi):
-    pi.set_servo_pulsewidth(SERVO_RIGHT_PIN, SPIN_RIGHT_RIGHT)
-    pi.set_servo_pulsewidth(SERVO_LEFT_PIN,  SPIN_RIGHT_LEFT)
-
-def spin_left(pi):
-    pi.set_servo_pulsewidth(SERVO_RIGHT_PIN, SPIN_LEFT_RIGHT)
-    pi.set_servo_pulsewidth(SERVO_LEFT_PIN,  SPIN_LEFT_LEFT)
+def servo_stop(pi: pigpio.pi):
+    pi.set_servo_pulsewidth(SERVO1_PIN, STOP_PW)
+    pi.set_servo_pulsewidth(SERVO2_PIN, STOP_PW)
 
 
-# =========================================
-# センサ取得
-# =========================================
-def get_magnetic(sensor):
-    """
-    BNO055の磁気センサ値を取得
-    戻り値: (mx, my, mz) / 読めないときは (None, None, None)
-    """
-    try:
-        mag = sensor.magnetic
-        if mag is None:
-            return None, None, None
-        mx, my, mz = mag
-        if mx is None or my is None or mz is None:
-            return None, None, None
-        return float(mx), float(my), float(mz)
-    except Exception:
-        return None, None, None
+def servo_free(pi: pigpio.pi):
+    pi.set_servo_pulsewidth(SERVO1_PIN, 0)
+    pi.set_servo_pulsewidth(SERVO2_PIN, 0)
 
-def get_euler(sensor):
-    """
-    参考用。内部融合値は信用しない前提でも、
-    ログとして取っておくと切り分けに役立つ。
-    戻り値: (heading, roll, pitch) / 取得失敗時は (None, None, None)
-    """
-    try:
-        e = sensor.euler
-        if e is None:
-            return None, None, None
-        h, r, p = e
-        return h, r, p
-    except Exception:
-        return None, None, None
 
-def get_accel(sensor):
-    try:
-        a = sensor.acceleration
-        if a is None:
-            return None, None, None
-        ax, ay, az = a
-        return ax, ay, az
-    except Exception:
-        return None, None, None
+def servo_spin(pi: pigpio.pi, direction: str):
+    if direction == "left":
+        pi.set_servo_pulsewidth(SERVO1_PIN, LEFT_SPIN_R_PW)
+        pi.set_servo_pulsewidth(SERVO2_PIN, LEFT_SPIN_L_PW)
+    elif direction == "right":
+        pi.set_servo_pulsewidth(SERVO1_PIN, RIGHT_SPIN_R_PW)
+        pi.set_servo_pulsewidth(SERVO2_PIN, RIGHT_SPIN_L_PW)
+    else:
+        raise ValueError("direction must be 'left' or 'right'")
 
 
 # =========================================
-# 補正とheading
+# BNO055
 # =========================================
-def heading_deg(x, y):
-    """
-    atan2ベースで0~360 degに正規化
-    """
-    deg = math.degrees(math.atan2(y, x))
-    if deg < 0:
-        deg += 360.0
-    return deg
+def init_bno055():
+    i2c = busio.I2C(board.SCL, board.SDA)
+    sensor = adafruit_bno055.BNO055_I2C(i2c, address=0x28)
+    time.sleep(1.0)
+    return sensor
 
-def corrected_xy_offset(mx, my, offset_x, offset_y):
-    return mx - offset_x, my - offset_y
 
-def corrected_xy_offset_scale(mx, my, offset_x, offset_y, radius_x, radius_y):
-    cx = mx - offset_x
-    cy = my - offset_y
-
-    sx = None
-    sy = None
-    if radius_x is not None and abs(radius_x) > 1e-9:
-        sx = cx / radius_x
-    if radius_y is not None and abs(radius_y) > 1e-9:
-        sy = cy / radius_y
-    return sx, sy
-
-def circular_std_deg(angle_list_deg):
-    """
-    角度の円統計的ばらつきの簡易指標
-    値が小さいほど安定
-    """
-    if not angle_list_deg:
+def read_mag_xy(sensor):
+    mag = sensor.magnetic  # (x, y, z) [uT] or None
+    if mag is None:
         return None
-    rad = [math.radians(a) for a in angle_list_deg]
-    c = sum(math.cos(r) for r in rad) / len(rad)
-    s = sum(math.sin(r) for r in rad) / len(rad)
-    R = math.sqrt(c*c + s*s)
-    if R <= 0:
+    x, y, z = mag
+    if x is None or y is None:
         return None
-    return math.degrees(math.sqrt(-2.0 * math.log(R)))
+    if REJECT_NONE_OR_ZERO and (abs(x) < 1e-9 and abs(y) < 1e-9):
+        return None
+    return float(x), float(y), float(z if z is not None else 0.0)
 
 
 # =========================================
-# ログ保存
+# 補正計算
 # =========================================
-def ensure_dir(path):
-    os.makedirs(path, exist_ok=True)
-
-def save_csv(path, rows, fieldnames):
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-# =========================================
-# 計測
-# =========================================
-def capture_phase(sensor, duration_sec, phase_name, correction=None):
+def compute_hardiron_offsets(x, y):
     """
-    correction:
-      None
-      or dict with keys:
-        offset_x, offset_y, radius_x, radius_y
+    Qiita記事ベース:
+      offset_x = (max_x + min_x)/2
+      offset_y = (max_y + min_y)/2
     """
-    rows = []
-    t0 = time.monotonic()
+    x = np.asarray(x)
+    y = np.asarray(y)
 
-    while (time.monotonic() - t0) < duration_sec:
-        now = time.monotonic()
-        mx, my, mz = get_magnetic(sensor)
-        eh, er, ep = get_euler(sensor)
-        ax, ay, az = get_accel(sensor)
+    x_min, x_max = np.min(x), np.max(x)
+    y_min, y_max = np.min(y), np.max(y)
 
-        row = {
-            "phase": phase_name,
-            "t_rel_sec": now - t0,
-            "mx_uT": mx,
-            "my_uT": my,
-            "mz_uT": mz,
-            "accel_x": ax,
-            "accel_y": ay,
-            "accel_z": az,
-            "euler_heading": eh,
-            "euler_roll": er,
-            "euler_pitch": ep,
-            "raw_heading_xy_deg": None,
-            "corr_heading_offset_deg": None,
-            "corr_heading_offset_scale_deg": None,
-            "corr_x_offset": None,
-            "corr_y_offset": None,
-            "corr_x_scale": None,
-            "corr_y_scale": None,
-        }
+    off_x = (x_max + x_min) / 2.0
+    off_y = (y_max + y_min) / 2.0
 
-        if mx is not None and my is not None:
-            row["raw_heading_xy_deg"] = heading_deg(mx, my)
-
-            if correction is not None:
-                ox = correction["offset_x"]
-                oy = correction["offset_y"]
-                rx = correction["radius_x"]
-                ry = correction["radius_y"]
-
-                cx, cy = corrected_xy_offset(mx, my, ox, oy)
-                row["corr_x_offset"] = cx
-                row["corr_y_offset"] = cy
-                row["corr_heading_offset_deg"] = heading_deg(cx, cy)
-
-                sx, sy = corrected_xy_offset_scale(mx, my, ox, oy, rx, ry)
-                row["corr_x_scale"] = sx
-                row["corr_y_scale"] = sy
-                if sx is not None and sy is not None:
-                    row["corr_heading_offset_scale_deg"] = heading_deg(sx, sy)
-
-        rows.append(row)
-        time.sleep(SAMPLE_INTERVAL_SEC)
-
-    return rows
-
-
-def compute_calibration_from_rows(rows):
-    xs = [r["mx_uT"] for r in rows if r["mx_uT"] is not None]
-    ys = [r["my_uT"] for r in rows if r["my_uT"] is not None]
-
-    if len(xs) < 20 or len(ys) < 20:
-        raise RuntimeError("有効な磁気データが少なすぎます。")
-
-    x_min = min(xs)
-    x_max = max(xs)
-    y_min = min(ys)
-    y_max = max(ys)
-
-    offset_x = (x_max + x_min) / 2.0
-    offset_y = (y_max + y_min) / 2.0
     radius_x = (x_max - x_min) / 2.0
     radius_y = (y_max - y_min) / 2.0
 
-    ellipse_ratio = None
-    if radius_x > 1e-9 and radius_y > 1e-9:
-        ellipse_ratio = max(radius_x, radius_y) / min(radius_x, radius_y)
-
-    return {
-        "x_min": x_min,
-        "x_max": x_max,
-        "y_min": y_min,
-        "y_max": y_max,
-        "offset_x": offset_x,
-        "offset_y": offset_y,
-        "radius_x": radius_x,
-        "radius_y": radius_y,
-        "ellipse_ratio": ellipse_ratio,
-        "sample_count": len(xs),
-    }
+    return off_x, off_y, radius_x, radius_y
 
 
-def summarize_static_rows(rows):
-    def valid(key):
-        return [r[key] for r in rows if r[key] is not None]
+def apply_hardiron(x, y, off_x, off_y):
+    x2 = np.asarray(x) - off_x
+    y2 = np.asarray(y) - off_y
+    return x2, y2
 
-    summary = {}
 
-    for key in [
-        "mx_uT", "my_uT", "mz_uT",
-        "raw_heading_xy_deg",
-        "corr_heading_offset_deg",
-        "corr_heading_offset_scale_deg",
-        "euler_heading",
-    ]:
-        vals = valid(key)
-        if vals:
-            summary[key] = {
-                "mean": statistics.mean(vals),
-                "median": statistics.median(vals),
-                "min": min(vals),
-                "max": max(vals),
-                "stddev": statistics.pstdev(vals) if len(vals) >= 2 else 0.0,
-            }
-            if "heading" in key:
-                csd = circular_std_deg(vals)
-                summary[key]["circular_std_deg"] = csd
+def apply_softiron_simple_scale(x, y):
+    """
+    簡易2Dスケール補正:
+      x, y の半径差を平均半径に合わせる
+    回転行列を伴う厳密楕円フィットではない。
+    """
+    x = np.asarray(x)
+    y = np.asarray(y)
 
-    return summary
+    rx = (np.max(x) - np.min(x)) / 2.0
+    ry = (np.max(y) - np.min(y)) / 2.0
+
+    if rx <= 1e-9 or ry <= 1e-9:
+        return x.copy(), y.copy(), 1.0, 1.0
+
+    r_avg = (rx + ry) / 2.0
+    sx = r_avg / rx
+    sy = r_avg / ry
+
+    return x * sx, y * sy, sx, sy
+
+
+def heading_deg_from_xy(x, y):
+    """
+    atan(y/x) ではなく atan2(y, x) を使う。
+    0～360 deg に正規化。
+    """
+    th = math.degrees(math.atan2(y, x))
+    if th < 0:
+        th += 360.0
+    return th
 
 
 # =========================================
-# main
+# 記録
+# =========================================
+def collect_data(sensor, pi=None, auto_spin=True, spin_direction="left",
+                 calib_seconds=20.0, sample_hz=10.0):
+    data = []
+
+    dt = 1.0 / sample_hz
+
+    print(f"[INFO] stop {PRE_STOP_SEC:.1f} sec")
+    if pi is not None:
+        servo_stop(pi)
+    time.sleep(PRE_STOP_SEC)
+
+    if auto_spin and pi is not None:
+        print(f"[INFO] start auto spin: {spin_direction}")
+        servo_spin(pi, spin_direction)
+    else:
+        print("[INFO] manual mode: rotate CanSat by hand slowly and cover full 360 deg")
+
+    t0 = time.time()
+    n_ok = 0
+    n_all = 0
+
+    while True:
+        now = time.time()
+        elapsed = now - t0
+        if elapsed >= calib_seconds:
+            break
+
+        mag = read_mag_xy(sensor)
+        n_all += 1
+
+        if mag is not None:
+            x, y, z = mag
+            data.append([elapsed, x, y, z])
+            n_ok += 1
+            print(f"\r[INFO] t={elapsed:5.2f}s  x={x:8.3f}  y={y:8.3f}  z={z:8.3f}  samples={n_ok}", end="")
+
+        time.sleep(dt)
+
+    print()
+
+    if pi is not None:
+        servo_stop(pi)
+        time.sleep(POST_STOP_SEC)
+
+    print(f"[INFO] collected valid samples = {n_ok} / {n_all}")
+    return data
+
+
+def save_csv(path, rows, header):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+# =========================================
+# プロット
+# =========================================
+def plot_before_after(x_raw, y_raw, x_corr, y_corr, png_path):
+    plt.figure(figsize=(8, 8))
+    plt.scatter(x_raw, y_raw, label="measured values", s=35)
+    plt.scatter(x_corr, y_corr, label="fixed values", s=35, marker="^")
+    plt.title("The Values of Geomagnetism")
+    plt.xlabel("x_mag")
+    plt.ylabel("y_mag")
+    plt.axis("equal")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=150)
+    plt.close()
+
+
+# =========================================
+# メイン
 # =========================================
 def main():
-    ensure_dir(OUTPUT_DIR)
-
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = os.path.join(OUTPUT_DIR, f"mag_cal_{stamp}")
-    csv_path = base + ".csv"
-    json_path = base + ".json"
-
     pi = pigpio.pi()
     if not pi.connected:
-        raise RuntimeError("pigpio daemon に接続できません。sudo pigpiod を確認してください。")
-
-    i2c = busio.I2C(board.SCL, board.SDA)
-    sensor = adafruit_bno055.BNO055_I2C(i2c, address=BNO055_ADDR)
-
-    all_rows = []
-    result = {
-        "timestamp": stamp,
-        "settings": {
-            "SERVO_RIGHT_PIN": SERVO_RIGHT_PIN,
-            "SERVO_LEFT_PIN": SERVO_LEFT_PIN,
-            "STOP_RIGHT": STOP_RIGHT,
-            "STOP_LEFT": STOP_LEFT,
-            "SPIN_RIGHT_RIGHT": SPIN_RIGHT_RIGHT,
-            "SPIN_RIGHT_LEFT": SPIN_RIGHT_LEFT,
-            "SPIN_LEFT_RIGHT": SPIN_LEFT_RIGHT,
-            "SPIN_LEFT_LEFT": SPIN_LEFT_LEFT,
-            "CALIBRATION_TIME_SEC": CALIBRATION_TIME_SEC,
-            "STATIC_BEFORE_SEC": STATIC_BEFORE_SEC,
-            "STATIC_AFTER_SEC": STATIC_AFTER_SEC,
-            "SAMPLE_INTERVAL_SEC": SAMPLE_INTERVAL_SEC,
-            "BNO055_ADDR": hex(BNO055_ADDR),
-        }
-    }
+        raise RuntimeError("pigpio に接続できません。先に 'sudo pigpiod' を実行してください。")
 
     try:
-        print("サーボ停止")
-        safe_stop_servos(pi)
-        time.sleep(2.0)
+        sensor = init_bno055()
 
-        print(f"静止ログ(補正前)を {STATIC_BEFORE_SEC} 秒取得します")
-        rows_static_before = capture_phase(
+        print("[INFO] BNO055 calibration status:", sensor.calibration_status)
+        print("[INFO] collecting magnetometer data...")
+
+        raw = collect_data(
             sensor=sensor,
-            duration_sec=STATIC_BEFORE_SEC,
-            phase_name="static_before",
-            correction=None
+            pi=pi,
+            auto_spin=AUTO_SPIN,
+            spin_direction=SPIN_DIRECTION,
+            calib_seconds=CALIB_SECONDS,
+            sample_hz=SAMPLE_HZ,
         )
-        all_rows.extend(rows_static_before)
 
-        print(f"平面上で右旋回しながらキャリブレーションデータを {CALIBRATION_TIME_SEC} 秒取得します")
-        spin_right(pi)
-        rows_cal = []
-        t0 = time.monotonic()
-        while (time.monotonic() - t0) < CALIBRATION_TIME_SEC:
-            rows = capture_phase(
-                sensor=sensor,
-                duration_sec=SAMPLE_INTERVAL_SEC,
-                phase_name="calibration_spin",
-                correction=None
-            )
-            if rows:
-                rows_cal.extend(rows)
-                all_rows.extend(rows)
-                last = rows[-1]
-                mx = last["mx_uT"]
-                my = last["my_uT"]
-                mz = last["mz_uT"]
-                print(f"\rmx={mx!s:>8} my={my!s:>8} mz={mz!s:>8} count={len(rows_cal)}", end="")
-        print()
+        if len(raw) < 20:
+            raise RuntimeError("有効サンプルが少なすぎます。回転時間を延ばすか、取得周波数を見直してください。")
 
-        safe_stop_servos(pi)
-        time.sleep(1.0)
+        raw = np.asarray(raw)
+        t = raw[:, 0]
+        x_raw = raw[:, 1]
+        y_raw = raw[:, 2]
+        z_raw = raw[:, 3]
 
-        cal = compute_calibration_from_rows(rows_cal)
-        result["calibration"] = cal
+        # 1) hard-iron補正
+        off_x, off_y, radius_x, radius_y = compute_hardiron_offsets(x_raw, y_raw)
+        x_hard, y_hard = apply_hardiron(x_raw, y_raw, off_x, off_y)
 
-        correction = {
-            "offset_x": cal["offset_x"],
-            "offset_y": cal["offset_y"],
-            "radius_x": cal["radius_x"],
-            "radius_y": cal["radius_y"],
-        }
+        # 2) 簡易soft-ironスケール補正
+        x_corr, y_corr, sx, sy = apply_softiron_simple_scale(x_hard, y_hard)
 
-        print("=== Calibration result ===")
-        print(f"offset_x     = {cal['offset_x']:.6f}")
-        print(f"offset_y     = {cal['offset_y']:.6f}")
-        print(f"radius_x     = {cal['radius_x']:.6f}")
-        print(f"radius_y     = {cal['radius_y']:.6f}")
-        print(f"ellipse_ratio= {cal['ellipse_ratio']:.6f}" if cal["ellipse_ratio"] is not None else "ellipse_ratio= None")
-        print(f"sample_count = {cal['sample_count']}")
+        # heading例
+        heading_rows = []
+        for i in range(len(t)):
+            hdg_raw = heading_deg_from_xy(x_raw[i], y_raw[i])
+            hdg_corr = heading_deg_from_xy(x_corr[i], y_corr[i])
+            heading_rows.append([t[i], x_raw[i], y_raw[i], x_corr[i], y_corr[i], hdg_raw, hdg_corr])
 
-        print(f"静止ログ(補正後評価用)を {STATIC_AFTER_SEC} 秒取得します")
-        rows_static_after = capture_phase(
-            sensor=sensor,
-            duration_sec=STATIC_AFTER_SEC,
-            phase_name="static_after",
-            correction=correction
+        # 保存
+        csv_raw = OUTDIR / "mag_raw.csv"
+        csv_corr = OUTDIR / "mag_corrected.csv"
+        png_path = OUTDIR / "mag_calibration_plot.png"
+        txt_path = OUTDIR / "calibration_result.txt"
+
+        save_csv(
+            csv_raw,
+            raw.tolist(),
+            ["time_sec", "x_raw_uT", "y_raw_uT", "z_raw_uT"]
         )
-        all_rows.extend(rows_static_after)
 
-        # calibration_spin に対しても補正列をあと付け
-        for r in rows_cal:
-            mx = r["mx_uT"]
-            my = r["my_uT"]
-            if mx is not None and my is not None:
-                r["raw_heading_xy_deg"] = heading_deg(mx, my)
+        corr_rows = []
+        for i in range(len(t)):
+            corr_rows.append([
+                t[i],
+                x_raw[i], y_raw[i], z_raw[i],
+                x_hard[i], y_hard[i],
+                x_corr[i], y_corr[i],
+                heading_deg_from_xy(x_raw[i], y_raw[i]),
+                heading_deg_from_xy(x_corr[i], y_corr[i]),
+            ])
 
-                cx, cy = corrected_xy_offset(mx, my, correction["offset_x"], correction["offset_y"])
-                r["corr_x_offset"] = cx
-                r["corr_y_offset"] = cy
-                r["corr_heading_offset_deg"] = heading_deg(cx, cy)
+        save_csv(
+            csv_corr,
+            corr_rows,
+            [
+                "time_sec",
+                "x_raw_uT", "y_raw_uT", "z_raw_uT",
+                "x_hard_uT", "y_hard_uT",
+                "x_corr_uT", "y_corr_uT",
+                "heading_raw_deg", "heading_corr_deg"
+            ]
+        )
 
-                sx, sy = corrected_xy_offset_scale(
-                    mx, my,
-                    correction["offset_x"], correction["offset_y"],
-                    correction["radius_x"], correction["radius_y"]
-                )
-                r["corr_x_scale"] = sx
-                r["corr_y_scale"] = sy
-                if sx is not None and sy is not None:
-                    r["corr_heading_offset_scale_deg"] = heading_deg(sx, sy)
+        plot_before_after(x_raw, y_raw, x_corr, y_corr, png_path)
 
-        result["summary"] = {
-            "static_before": summarize_static_rows(rows_static_before),
-            "static_after": summarize_static_rows(rows_static_after),
-        }
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write("=== Calibration result ===\n")
+            f.write(f"offset_x = {off_x:.6f}\n")
+            f.write(f"offset_y = {off_y:.6f}\n")
+            f.write(f"radius_x = {radius_x:.6f}\n")
+            f.write(f"radius_y = {radius_y:.6f}\n")
+            f.write(f"scale_x = {sx:.6f}\n")
+            f.write(f"scale_y = {sy:.6f}\n")
+            f.write(f"ellipse_ratio_before = {radius_x / radius_y if abs(radius_y) > 1e-9 else float('inf'):.6f}\n")
 
-        # 行の整形
-        fieldnames = [
-            "phase", "t_rel_sec",
-            "mx_uT", "my_uT", "mz_uT",
-            "accel_x", "accel_y", "accel_z",
-            "euler_heading", "euler_roll", "euler_pitch",
-            "raw_heading_xy_deg",
-            "corr_heading_offset_deg",
-            "corr_heading_offset_scale_deg",
-            "corr_x_offset", "corr_y_offset",
-            "corr_x_scale", "corr_y_scale",
-        ]
-        save_csv(csv_path, all_rows, fieldnames)
-        save_json(json_path, result)
+        print("\n=== Calibration result ===")
+        print(f"offset_x = {off_x:.6f}")
+        print(f"offset_y = {off_y:.6f}")
+        print(f"radius_x = {radius_x:.6f}")
+        print(f"radius_y = {radius_y:.6f}")
+        print(f"scale_x  = {sx:.6f}")
+        print(f"scale_y  = {sy:.6f}")
+        print(f"ellipse_ratio_before = {radius_x / radius_y if abs(radius_y) > 1e-9 else float('inf'):.6f}")
 
-        print()
-        print("保存完了")
-        print(f"CSV : {csv_path}")
-        print(f"JSON: {json_path}")
+        print("\n[INFO] saved:")
+        print(f"  {csv_raw}")
+        print(f"  {csv_corr}")
+        print(f"  {png_path}")
+        print(f"  {txt_path}")
 
-    except KeyboardInterrupt:
-        print("\n中断されました。")
     finally:
-        safe_stop_servos(pi)
-        time.sleep(0.5)
-        free_servos(pi)
+        try:
+            servo_stop(pi)
+            time.sleep(0.5)
+            servo_free(pi)
+        except Exception:
+            pass
         pi.stop()
-        print("Finish")
 
 
 if __name__ == "__main__":
