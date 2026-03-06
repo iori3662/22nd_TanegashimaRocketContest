@@ -1,0 +1,23 @@
+{
+  "mag_min": [
+    Infinity,
+    Infinity,
+    Infinity
+  ],
+  "mag_max": [
+    -Infinity,
+    -Infinity,
+    -Infinity
+  ],
+  "offset": [
+    NaN,
+    NaN,
+    NaN
+  ],
+  "scale": [
+    -Infinity,
+    -Infinity,
+    -Infinity
+  ],
+  "declination_deg": 0.0
+}

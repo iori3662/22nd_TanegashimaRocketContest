@@ -1,0 +1,126 @@
+{
+  "timestamp": "20260307_002709",
+  "settings": {
+    "SERVO_RIGHT_PIN": 18,
+    "SERVO_LEFT_PIN": 12,
+    "STOP_RIGHT": 1490,
+    "STOP_LEFT": 1490,
+    "SPIN_RIGHT_RIGHT": 2000,
+    "SPIN_RIGHT_LEFT": 2000,
+    "SPIN_LEFT_RIGHT": 1000,
+    "SPIN_LEFT_LEFT": 1000,
+    "CALIBRATION_TIME_SEC": 20.0,
+    "STATIC_BEFORE_SEC": 5.0,
+    "STATIC_AFTER_SEC": 5.0,
+    "SAMPLE_INTERVAL_SEC": 0.05,
+    "BNO055_ADDR": "0x28"
+  },
+  "calibration": {
+    "x_min": -2019.25,
+    "x_max": 44.375,
+    "y_min": -41.25,
+    "y_max": 2016.75,
+    "offset_x": -987.4375,
+    "offset_y": 987.75,
+    "radius_x": 1031.8125,
+    "radius_y": 1029.0,
+    "ellipse_ratio": 1.0027332361516035,
+    "sample_count": 331
+  },
+  "summary": {
+    "static_before": {
+      "mx_uT": {
+        "mean": 22.53840361445783,
+        "median": 25.375,
+        "min": 16.25,
+        "max": 27.25,
+        "stddev": 4.067493818137816
+      },
+      "my_uT": {
+        "mean": 27.791415662650603,
+        "median": 27.875,
+        "min": 26.6875,
+        "max": 29.0,
+        "stddev": 0.4809312929617516
+      },
+      "mz_uT": {
+        "mean": -103.97138554216868,
+        "median": -103.875,
+        "min": -105.5625,
+        "max": -102.5,
+        "stddev": 0.6867329513995662
+      },
+      "raw_heading_xy_deg": {
+        "mean": 51.314808188124,
+        "median": 47.687968965603574,
+        "min": 45.601683850612076,
+        "max": 59.2824717483511,
+        "stddev": 5.3079259563703785,
+        "circular_std_deg": 5.31129746028811
+      },
+      "euler_heading": {
+        "mean": 340.66039156626505,
+        "median": 367.9375,
+        "min": -1680.0625,
+        "max": 367.9375,
+        "stddev": 223.18279899027348,
+        "circular_std_deg": 11.26259541079335
+      }
+    },
+    "static_after": {
+      "mx_uT": {
+        "mean": 36.72767857142857,
+        "median": 34.625,
+        "min": 25.0,
+        "max": 43.1875,
+        "stddev": 4.622653069037701
+      },
+      "my_uT": {
+        "mean": -8.509672619047619,
+        "median": -8.6875,
+        "min": -9.875,
+        "max": -5.6875,
+        "stddev": 0.7678005441257562
+      },
+      "mz_uT": {
+        "mean": -45.945684523809526,
+        "median": -45.9375,
+        "min": -47.6875,
+        "max": -44.0,
+        "stddev": 0.8154011712756062
+      },
+      "raw_heading_xy_deg": {
+        "mean": 346.79425816527095,
+        "median": 346.49340945387166,
+        "min": 342.3308057925853,
+        "max": 351.78635876386386,
+        "stddev": 1.7933793206783502,
+        "circular_std_deg": 1.7933897462567912
+      },
+      "corr_heading_offset_deg": {
+        "mean": 315.7910108409072,
+        "median": 315.73182616328955,
+        "min": 315.48670913811196,
+        "max": 316.00874891413326,
+        "stddev": 0.12666574699595962,
+        "circular_std_deg": 0.12666577480737265
+      },
+      "corr_heading_offset_scale_deg": {
+        "mean": 315.71284392818274,
+        "median": 315.65365441352736,
+        "min": 315.4085240727907,
+        "max": 315.9305990930952,
+        "stddev": 0.12667478467553017,
+        "circular_std_deg": 0.12667481249485482
+      },
+      "euler_heading": {
+        "mean": 139.33556547619048,
+        "median": 142.375,
+        "min": 134.375,
+        "max": 142.4375,
+        "stddev": 3.882263015779464,
+        "circular_std_deg": 3.883570715322218
+      }
+    }
+  }
+}
