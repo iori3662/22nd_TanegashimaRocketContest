@@ -375,6 +375,24 @@ class NmeaGpsReader:
 
                 time.sleep(0.02)
 
+class MedianLatLonFilter:
+    def __init__(self, window=5):
+        self.lat_buf = deque(maxlen=window)
+        self.lon_buf = deque(maxlen=window)
+
+    def update(self, lat, lon):
+        if lat is None or lon is None:
+            return None, None
+
+        self.lat_buf.append(lat)
+        self.lon_buf.append(lon)
+
+        if len(self.lat_buf) == 0:
+            return lat, lon
+
+        lat_f = statistics.median(self.lat_buf)
+        lon_f = statistics.median(self.lon_buf)
+        return lat_f, lon_f
 
 # ============================================================
 # 4) 磁気キャリブレーション
@@ -537,25 +555,28 @@ class GpsGuidance:
         self.drive = drive
         self.bno = bno
         self.gps = gps_reader
-        self.calib = calib   # 互換のため残すが heading 計算には使わない
+        self.calib = calib
         self.declination_deg = declination_deg
         self.log = logger
         self._last_log = time.monotonic()
 
-        # スタック判定用
         self._stuck_t0 = None
         self._stuck_d0 = None
 
-        # デバッグ出力用
         self.last_dist = None
         self.last_theta_goal = None
-        self.last_heading = None           # 真北基準 heading
-        self.last_heading_mag = None       # 磁北基準 heading (BNO生値)
-        self.last_heading_true = None      # 真北基準 heading
+        self.last_heading = None
+        self.last_heading_mag = None
+        self.last_heading_true = None
         self.last_err = None
         self.last_turn_cmd = 0.0
         self.last_cmd_fwd = 0.0
         self.last_calib_stat = None
+
+        self.pos_filter = MedianLatLonFilter(window=5)
+
+        # bearing の急変を抑える
+        self._theta_goal_lp = None
 
     def _gps_ok(self, fix: GpsFix) -> bool:
         c = self.cfg
@@ -572,9 +593,6 @@ class GpsGuidance:
         return True
 
     def _get_bno_calib_status(self):
-        """
-        返り値: (sys, gyro, accel, mag) or None
-        """
         try:
             c = self.bno.calibration_status
             if c is None:
@@ -584,12 +602,8 @@ class GpsGuidance:
             return None
 
     def _get_heading_deg(self) -> float | None:
-        """
-        BNO055の融合済みEuler headingを使用し、
-        偏角を加えて真北基準へ変換する。
-        """
         try:
-            e = self.bno.euler   # (heading, roll, pitch)
+            e = self.bno.euler
         except Exception:
             return None
 
@@ -603,15 +617,24 @@ class GpsGuidance:
         self.last_heading_true = heading_true
         return heading_true
 
+    def _lowpass_angle_deg(self, prev_deg, new_deg, alpha):
+        if prev_deg is None:
+            return new_deg
+        diff = wrap_to_180(new_deg - prev_deg)
+        return (prev_deg + alpha * diff) % 360.0
+
     def step(self) -> tuple[bool, bool]:
         """
         戻り値:
-          (arrived, stuck_suspected)
+          (gps_done, stuck_suspected)
+
+        gps_done=True なら GPS誘導を終了して次フェーズへ
         """
         c = self.cfg
         fix = self.gps.get()
         heading = self._get_heading_deg()
         calib_stat = self._get_bno_calib_status()
+
         self.last_calib_stat = calib_stat
         self.last_heading = heading
 
@@ -621,35 +644,60 @@ class GpsGuidance:
             self.last_cmd_fwd = 0.0
             return (False, False)
 
-        dist = haversine_m(fix.lat, fix.lon, c.goal_lat, c.goal_lon)
+        # ---- 緯度経度を中央値フィルタ ----
+        lat_f, lon_f = self.pos_filter.update(fix.lat, fix.lon)
+        if lat_f is None or lon_f is None:
+            self.drive.stop()
+            return (False, False)
+
+        dist = haversine_m(lat_f, lon_f, c.goal_lat, c.goal_lon)
         self.last_dist = dist
 
+        # ---- 近距離になったらGPS誘導終了 ----
         if dist <= c.arrival_radius_m:
             self.drive.stop()
             self.last_turn_cmd = 0.0
             self.last_cmd_fwd = 0.0
-            self.log(f"[GPS] ARRIVED dist={dist:.2f}m <= {c.arrival_radius_m}m")
+            self.log(f"[GPS] DONE -> CAMERA dist={dist:.2f}m <= {c.arrival_radius_m}m")
             return (True, False)
 
-        # bearing_deg() は真北基準
-        theta_goal = bearing_deg(fix.lat, fix.lon, c.goal_lat, c.goal_lon)
-        err = wrap_to_180(theta_goal - heading)
+        # ---- goal bearing を計算 ----
+        theta_goal_raw = bearing_deg(lat_f, lon_f, c.goal_lat, c.goal_lon)
 
+        # bearing の急変を抑える
+        # 遠距離では追従性重視、中距離では安定性重視
+        if dist > 20.0:
+            alpha = 0.35
+        else:
+            alpha = 0.18
+
+        theta_goal = self._lowpass_angle_deg(self._theta_goal_lp, theta_goal_raw, alpha)
+        self._theta_goal_lp = theta_goal
         self.last_theta_goal = theta_goal
+
+        err = wrap_to_180(theta_goal - heading)
         self.last_err = err
 
-        # 距離に応じて前進割合 v を決める
-        if dist < c.slowdown_dist_m:
-            a = clamp(dist / c.slowdown_dist_m, 0.0, 1.0)
+        # ---- 距離に応じて速度を変える ----
+        if dist > 20.0:
+            v = c.base_v
+        elif dist > 12.0:
+            # 中距離では少し減速
+            a = (dist - 12.0) / (20.0 - 12.0)
+            a = clamp(a, 0.0, 1.0)
             v = c.min_v + (c.base_v - c.min_v) * a
         else:
-            v = c.base_v
+            v = c.min_v
 
-        # 旋回割合 turn
+        # ---- 旋回量 ----
         if abs(err) < c.angle_ok_deg:
-            turn = c.turn_bias
+            turn = 0.0
         else:
-            turn = clamp(c.kp * err + c.turn_bias, -c.turn_max, c.turn_max)
+            turn = clamp(c.kp * err, -c.turn_max, c.turn_max)
+
+        # 近距離ほど旋回を弱める
+        if dist <= 20.0:
+            turn *= 0.75
 
         fwd_power = int(v * self.drive.cfg.max_delta)
         turn_power = int(turn * self.drive.cfg.max_delta)
@@ -658,9 +706,10 @@ class GpsGuidance:
         self.last_cmd_fwd = v
         self.last_turn_cmd = turn
 
-        # ---- スタック疑い判定 ----
+        # ---- スタック判定 ----
+        # 近距離では GPS ノイズで誤判定しやすいので無効化
         stuck = False
-        if v >= 0.55:
+        if dist > 20.0 and v >= 0.50:
             if self._stuck_t0 is None:
                 self._stuck_t0 = time.monotonic()
                 self._stuck_d0 = dist
@@ -683,7 +732,7 @@ class GpsGuidance:
                 calib_str = f"sys={calib_stat[0]} gyro={calib_stat[1]} acc={calib_stat[2]} mag={calib_stat[3]}"
 
             self.log(
-                f"[GPS] dist={dist:6.1f}m "
+                f"[GPS] dist={dist:5.1f}m "
                 f"goalT={theta_goal:6.1f} "
                 f"headMag={self.last_heading_mag:6.1f} "
                 f"headTrue={heading:6.1f} "
@@ -1545,8 +1594,21 @@ def main():
     gps_cfg = GpsConfig(
         goal_lat=35.66059,
         goal_lon=139.36688,
-        arrival_radius_m=1.0,
-        angle_ok_deg=3.0,
+
+        control_hz=5.0,          # 10Hz→5Hzで十分
+        arrival_radius_m=10.0,   # GPS到達判定を大きく
+        angle_ok_deg=8.0,        # 少し緩める
+
+        base_v=0.62,
+        min_v=0.38,
+        slowdown_dist_m=20.0,
+
+        kp=0.012,                # 旋回ゲインを下げる
+        turn_max=0.55,           # 飽和を弱める
+        turn_bias=0.00,
+
+        stuck_window_sec=8.0,
+        stuck_min_progress_m=1.0
     )
 
     cam_cfg = CameraConfig(w=480, h=640, show_debug=False)
@@ -1586,7 +1648,7 @@ def main():
     gps_reader.start()
 
     calib = CompassCalib(valid=False, heading_extra_offset_deg=HEADING_EXTRA_OFFSET_DEG)
-        gps_guidance = GpsGuidance(
+    gps_guidance = GpsGuidance(
         gps_cfg,
         drive,
         bno,
@@ -1610,7 +1672,7 @@ def main():
         tw = TweliteSoftUART(pi, twe_cfg)
         print(f"[TWE] soft UART open: RX=GPIO{twe_cfg.rx_gpio}, TX=GPIO{twe_cfg.tx_gpio}, {twe_cfg.baud}bps")
         downlink = DownlinkManager(tw, telem, twe_cfg, logger=print)
-        downlink.start()
+        downlink.stop
     except Exception as e:
         print(f"[TWE] 初期化失敗: {e}")
         print("[TWE] ダウンリンクなしで続行します。")
@@ -1718,31 +1780,31 @@ def main():
                         time.sleep(3.0)
                         drive.stop()
 
-                        phase = Phase.CALIB
+                        phase = Phase.GPS
                         telem.update(phase=phase)
                         print(f"Phase: {phase}")
 
                 time.sleep(fall_cfg.dt)
                 continue
 
-            if phase == Phase.CALIB:
-                drive.stop()
-                telem.update(phase=phase, fall_phase="CALIB")
-                time.sleep(0.2)
+            # if phase == Phase.CALIB:
+            #     drive.stop()
+            #     telem.update(phase=phase, fall_phase="CALIB")
+            #     time.sleep(0.2)
 
-                run_compass_calibration(
-                    drive=drive,
-                    bno=bno,
-                    calib=calib,
-                    duration_sec=15.0,
-                    turn_power=220,
-                    logger=print,
-                )
+            #     run_compass_calibration(
+            #         drive=drive,
+            #         bno=bno,
+            #         calib=calib,
+            #         duration_sec=15.0,
+            #         turn_power=220,
+            #         logger=print,
+            #     )
 
-                phase = Phase.GPS
-                telem.update(phase=phase)
-                print(f"Phase: {phase}")
-                continue
+            #     phase = Phase.GPS
+            #     telem.update(phase=phase)
+            #     print(f"Phase: {phase}")
+            #     continue
 
             if phase == Phase.GPS:
                 dt = 1.0 / gps_cfg.control_hz
