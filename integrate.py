@@ -24,6 +24,13 @@ import pynmea2
 
 
 # ============================================================
+# 方位設定
+# ============================================================
+# 真北基準へ変換するための偏角 [deg]
+# 東偏なら +, 西偏なら -
+# まずは 0.0 で試し、必要に応じて現地値へ調整
+DECLINATION_DEG = 
+# ============================================================
 # 0) 共通ユーティリティ
 # ============================================================
 def clamp(x, lo, hi):
@@ -207,7 +214,7 @@ class FallLandingDetector:
 
 
 # ============================================================
-# 3) GPS (I2C NMEA) 受信スレッド
+# 3) GPS誘導関連
 # ============================================================
 @dataclass
 class GpsFix:
@@ -866,7 +873,7 @@ def main():
     print(f"Phase: {phase}")
 
     try:
-        while phase != Phase.DONE:
+        while phase != Phase.DONE and phase != Phase.DROP:
             # どのフェーズでも転倒復帰は最優先（センサが取れるときのみ）
             if not recovery.is_busy() and recovery.detect_flip():
                 recovery.start_recover("FLIP detected")
@@ -899,12 +906,10 @@ def main():
                         print("[DROP] LANDING CONFIRMED")
                         gpio_pulse_high(pi, GPIO_LANDING_PIN, 1.0, logger=print)
                         
-                        pi.set_servo_pulsewidth(SERVO1_PIN, 2000)
-                        pi.set_servo_pulsewidth(SERVO2_PIN, 2000)
+                        drive.set_diff(500, 0)
                         print("Positive servos...")
                         time.sleep(3)
-                        pi.set_servo_pulsewidth(SERVO1_PIN, 1490)
-                        pi.set_servo_pulsewidth(SERVO2_PIN, 1490)
+                        drive.stop()
                         print("Stopping servos...")
 
                         # ★追加：キャリブレーションへ

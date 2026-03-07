@@ -31,6 +31,12 @@ from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
 # ============================================================
+# 方位設定
+# ============================================================
+# 真北基準へ変換するための偏角 [deg]
+DECLINATION_DEG = -7.6
+
+# ============================================================
 # 0) 共通ユーティリティ
 # ============================================================
 def clamp(x, lo, hi):
@@ -525,24 +531,31 @@ class RecoveryManager:
 # 6) GPS誘導
 # ============================================================
 class GpsGuidance:
-    def __init__(self, cfg: GpsConfig, drive: ServoDrive, bno, gps_reader: NmeaGpsReader, calib: CompassCalib, logger=print):
+    def __init__(self, cfg: GpsConfig, drive: ServoDrive, bno, gps_reader: NmeaGpsReader,
+                 calib: CompassCalib, declination_deg: float = 0.0, logger=print):
         self.cfg = cfg
         self.drive = drive
         self.bno = bno
         self.gps = gps_reader
-        self.calib = calib
+        self.calib = calib   # 互換のため残すが heading 計算には使わない
+        self.declination_deg = declination_deg
         self.log = logger
         self._last_log = time.monotonic()
 
+        # スタック判定用
         self._stuck_t0 = None
         self._stuck_d0 = None
 
+        # デバッグ出力用
         self.last_dist = None
         self.last_theta_goal = None
-        self.last_heading = None
+        self.last_heading = None           # 真北基準 heading
+        self.last_heading_mag = None       # 磁北基準 heading (BNO生値)
+        self.last_heading_true = None      # 真北基準 heading
         self.last_err = None
         self.last_turn_cmd = 0.0
         self.last_cmd_fwd = 0.0
+        self.last_calib_stat = None
 
     def _gps_ok(self, fix: GpsFix) -> bool:
         c = self.cfg
@@ -558,29 +571,48 @@ class GpsGuidance:
             return False
         return True
 
-    def _get_heading_deg(self) -> float | None:
-        if self.calib.valid:
-            try:
-                mag = self.bno.magnetic
-            except Exception:
-                mag = None
-            hdg = self.calib.heading_from_mag(mag)
-            if hdg is not None:
-                return hdg
-
+    def _get_bno_calib_status(self):
+        """
+        返り値: (sys, gyro, accel, mag) or None
+        """
         try:
-            e = self.bno.euler
-            if e is not None and e[0] is not None:
-                return float(e[0]) % 360.0
+            c = self.bno.calibration_status
+            if c is None:
+                return None
+            return c
         except Exception:
-            pass
-        return None
+            return None
+
+    def _get_heading_deg(self) -> float | None:
+        """
+        BNO055の融合済みEuler headingを使用し、
+        偏角を加えて真北基準へ変換する。
+        """
+        try:
+            e = self.bno.euler   # (heading, roll, pitch)
+        except Exception:
+            return None
+
+        if e is None or e[0] is None:
+            return None
+
+        heading_mag = float(e[0]) % 360.0
+        heading_true = (heading_mag + self.declination_deg) % 360.0
+
+        self.last_heading_mag = heading_mag
+        self.last_heading_true = heading_true
+        return heading_true
 
     def step(self) -> tuple[bool, bool]:
+        """
+        戻り値:
+          (arrived, stuck_suspected)
+        """
         c = self.cfg
         fix = self.gps.get()
         heading = self._get_heading_deg()
-
+        calib_stat = self._get_bno_calib_status()
+        self.last_calib_stat = calib_stat
         self.last_heading = heading
 
         if heading is None or not self._gps_ok(fix):
@@ -599,18 +631,21 @@ class GpsGuidance:
             self.log(f"[GPS] ARRIVED dist={dist:.2f}m <= {c.arrival_radius_m}m")
             return (True, False)
 
+        # bearing_deg() は真北基準
         theta_goal = bearing_deg(fix.lat, fix.lon, c.goal_lat, c.goal_lon)
         err = wrap_to_180(theta_goal - heading)
 
         self.last_theta_goal = theta_goal
         self.last_err = err
 
+        # 距離に応じて前進割合 v を決める
         if dist < c.slowdown_dist_m:
             a = clamp(dist / c.slowdown_dist_m, 0.0, 1.0)
             v = c.min_v + (c.base_v - c.min_v) * a
         else:
             v = c.base_v
 
+        # 旋回割合 turn
         if abs(err) < c.angle_ok_deg:
             turn = c.turn_bias
         else:
@@ -623,6 +658,7 @@ class GpsGuidance:
         self.last_cmd_fwd = v
         self.last_turn_cmd = turn
 
+        # ---- スタック疑い判定 ----
         stuck = False
         if v >= 0.55:
             if self._stuck_t0 is None:
@@ -641,9 +677,21 @@ class GpsGuidance:
 
         now = time.monotonic()
         if now - self._last_log > 1.0:
+            if calib_stat is None:
+                calib_str = "None"
+            else:
+                calib_str = f"sys={calib_stat[0]} gyro={calib_stat[1]} acc={calib_stat[2]} mag={calib_stat[3]}"
+
             self.log(
-                f"[GPS] dist={dist:6.1f}m goal={theta_goal:6.1f} head={heading:6.1f} err={err:6.1f} "
-                f"v={v:.2f} turn={turn:.2f} nsat={fix.nsat} hdop={fix.hdop} calib={self.calib.valid}"
+                f"[GPS] dist={dist:6.1f}m "
+                f"goalT={theta_goal:6.1f} "
+                f"headMag={self.last_heading_mag:6.1f} "
+                f"headTrue={heading:6.1f} "
+                f"err={err:6.1f} "
+                f"v={v:.2f} turn={turn:.2f} "
+                f"nsat={fix.nsat} hdop={fix.hdop} "
+                f"decl={self.declination_deg:+.1f} "
+                f"calib[{calib_str}]"
             )
             self._last_log = now
 
@@ -1538,7 +1586,15 @@ def main():
     gps_reader.start()
 
     calib = CompassCalib(valid=False, heading_extra_offset_deg=HEADING_EXTRA_OFFSET_DEG)
-    gps_guidance = GpsGuidance(gps_cfg, drive, bno, gps_reader, calib, logger=print)
+        gps_guidance = GpsGuidance(
+        gps_cfg,
+        drive,
+        bno,
+        gps_reader,
+        calib,
+        declination_deg=DECLINATION_DEG,
+        logger=print
+    )
 
     rec_cfg = RecoveryConfig()
     recovery = RecoveryManager(rec_cfg, drive, bno, logger=print)
