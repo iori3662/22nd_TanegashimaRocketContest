@@ -1315,6 +1315,8 @@ def main():
 
     pi.set_mode(GPIO_LANDING_PIN, pigpio.OUTPUT)
     pi.write(GPIO_LANDING_PIN, 0)
+    pi.set_mode(GPIO_LED_PIN, pigpio.OUTPUT)
+    pi.write(GPIO_LED_PIN, 0)
 
     tw = None
     try:
@@ -1411,6 +1413,7 @@ def main():
                 )
                 drive.stop()
                 phase = Phase.DONE
+                pi.write(GPIO_LED_PIN, 1)
                 logger.log_event(f"Phase: {phase}", phase=phase, elapsed_sec=elapsed)
                 do_downlink(elapsed, phase, gps_reader.get())
                 continue
@@ -1718,6 +1721,7 @@ def main():
                 if goal:
                     goal_flag = True
                     phase = Phase.DONE
+                    pi.write(GPIO_LED_PIN, 1)
                     logger.log_event(f"Phase: {phase}", phase=phase, elapsed_sec=elapsed)
 
                 do_downlink(elapsed, phase, gps_fix)
@@ -1753,6 +1757,7 @@ def main():
             pass
         try:
             pi.write(GPIO_LANDING_PIN, 0)
+            pi.write(GPIO_LED_PIN, 0)
             pi.stop()
         except Exception:
             pass

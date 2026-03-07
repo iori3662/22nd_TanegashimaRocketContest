@@ -1188,6 +1188,7 @@ def main():
     cam_cfg = CameraConfig(w=480, h=640, show_debug=False)
 
     GPIO_LANDING_PIN = 17
+    GPIO_LED_PIN = 26
     HEADING_EXTRA_OFFSET_DEG = 0.0
 
     FORCE_GPS_AFTER_SEC = 15 * 60
@@ -1199,6 +1200,9 @@ def main():
 
     pi.set_mode(GPIO_LANDING_PIN, pigpio.OUTPUT)
     pi.write(GPIO_LANDING_PIN, 0)
+    
+    pi.set_mode(GPIO_LED_PIN, pigpio.OUTPUT)
+    pi.write(GPIO_LED_PIN, 0)
 
     servo_cfg = ServoConfig(stop_us=1490, min_us=500, max_us=2500, pin18=18, pin12=12, max_delta=500)
     drive = ServoDrive(pi, servo_cfg)
@@ -1245,6 +1249,9 @@ def main():
                 )
                 drive.stop()
                 phase = Phase.DONE
+                pi.write(GPIO_LED_PIN, 1)
+                
+                
                 logger.log_event(f"Phase: {phase}", phase=phase, elapsed_sec=elapsed)
                 continue
 
@@ -1541,6 +1548,7 @@ def main():
 
                 if goal:
                     phase = Phase.DONE
+                    pi.write(GPIO_LED_PIN, 1)
                     logger.log_event(f"Phase: {phase}", phase=phase, elapsed_sec=elapsed)
                 continue
 
@@ -1569,6 +1577,7 @@ def main():
             pass
         try:
             pi.write(GPIO_LANDING_PIN, 0)
+            pi.write(GPIO_LED_PIN, 0)
             pi.stop()
         except Exception:
             pass
