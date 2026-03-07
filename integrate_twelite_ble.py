@@ -393,6 +393,36 @@ class MedianLatLonFilter:
         lat_f = statistics.median(self.lat_buf)
         lon_f = statistics.median(self.lon_buf)
         return lat_f, lon_f
+    
+class GpsFilter:
+
+    def __init__(self, med_window=7, avg_window=3):
+        self.lat_med_buf = deque(maxlen=med_window)
+        self.lon_med_buf = deque(maxlen=med_window)
+
+        self.lat_avg_buf = deque(maxlen=avg_window)
+        self.lon_avg_buf = deque(maxlen=avg_window)
+
+    def update(self, lat, lon):
+
+        if lat is None or lon is None:
+            return None, None
+
+        # --- median ---
+        self.lat_med_buf.append(lat)
+        self.lon_med_buf.append(lon)
+
+        lat_med = statistics.median(self.lat_med_buf)
+        lon_med = statistics.median(self.lon_med_buf)
+
+        # --- average ---
+        self.lat_avg_buf.append(lat_med)
+        self.lon_avg_buf.append(lon_med)
+
+        lat_f = sum(self.lat_avg_buf) / len(self.lat_avg_buf)
+        lon_f = sum(self.lon_avg_buf) / len(self.lon_avg_buf)
+
+        return lat_f, lon_f
 
 # ============================================================
 # 4) 磁気キャリブレーション
@@ -645,7 +675,7 @@ class GpsGuidance:
             return (False, False)
 
         # ---- 緯度経度を中央値フィルタ ----
-        lat_f, lon_f = self.pos_filter.update(fix.lat, fix.lon)
+        lat_f, lon_f = self.gps_filter.update(fix.lat, fix.lon)
         if lat_f is None or lon_f is None:
             self.drive.stop()
             return (False, False)
@@ -678,16 +708,15 @@ class GpsGuidance:
         err = wrap_to_180(theta_goal - heading)
         self.last_err = err
 
-        # ---- 距離に応じて速度を変える ----
+        # ---- 基本速度 ----
         if dist > 20.0:
-            v = c.base_v
+            v_base = c.base_v
         elif dist > 12.0:
-            # 中距離では少し減速
             a = (dist - 12.0) / (20.0 - 12.0)
             a = clamp(a, 0.0, 1.0)
-            v = c.min_v + (c.base_v - c.min_v) * a
+            v_base = c.min_v + (c.base_v - c.min_v) * a
         else:
-            v = c.min_v
+            v_base = c.min_v
 
         # ---- 旋回量 ----
         if abs(err) < c.angle_ok_deg:
@@ -695,9 +724,23 @@ class GpsGuidance:
         else:
             turn = clamp(c.kp * err, -c.turn_max, c.turn_max)
 
-        # 近距離ほど旋回を弱める
         if dist <= 20.0:
             turn *= 0.75
+
+        # ---- 誤差に応じて前進を制限 ----
+        abs_err = abs(err)
+
+        if abs_err > 60.0:
+            # まず向きを合わせる
+            v = 0.0
+
+        elif abs_err > 25.0:
+            # 少しだけ前進
+            v = min(v_base, 0.28)
+
+        else:
+            # ほぼ向けているので普通に進む
+            v = v_base
 
         fwd_power = int(v * self.drive.cfg.max_delta)
         turn_power = int(turn * self.drive.cfg.max_delta)
