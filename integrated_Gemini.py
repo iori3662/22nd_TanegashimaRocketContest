@@ -22,8 +22,8 @@ from picamera2 import Picamera2
 # ============================================================
 # 1) 設定・パラメータ
 # ============================================================
-GOAL_LAT = 30.38790967   # 目的地 緯度
-GOAL_LON = 130.94442433  # 目的地 経度
+GOAL_LAT = 35.00000000   # 目的地 緯度
+GOAL_LON = 139.00000000  # 目的地 経度
 
 # 判定閾値
 TIME_LIMIT_SEC = 1200    # 20分強制終了
@@ -35,7 +35,7 @@ MEDIAN_WIN = 11          # 中央値フィルタの窓幅
 # モーター・サーボ設定 (実機仕様準拠)
 SERVO_L_PIN = 18
 SERVO_R_PIN = 12
-STOP_US = 1490
+STOP_US = 1490           # 停止パルス幅
 SERVO_SCALE = 500
 SPEED_STRAIGHT = 0.6
 SPEED_TURN = 0.4
@@ -119,8 +119,8 @@ class CanSatMaster:
         self.gps_buf = bytearray()
 
     def set_drive(self, fwd, turn):
-        left_p = STOP - int((fwd + turn) * SERVO_SCALE)
-        right_p = STOP + int((fwd - turn) * SERVO_SCALE)
+        left_p = STOP_US - int((fwd + turn) * SERVO_SCALE)
+        right_p = STOP_US + int((fwd - turn) * SERVO_SCALE)
         self.pi.set_servo_pulsewidth(SERVO_L_PIN, max(500, min(2500, left_p)))
         self.pi.set_servo_pulsewidth(SERVO_R_PIN, max(500, min(2500, right_p)))
 
@@ -191,29 +191,73 @@ class CanSatMaster:
 
     def run(self):
         try:
-            # 1. 落下・着陸
-            self.mode = "FLIGHT"
-            p_alt = self.bme.altitude
+            # 1. 落下検知フェーズ
+            self.mode = "WAIT_DROP"
+            print("Phase: Wait for Drop (Crane ascent...)")
+            p_alt = self.filter.update("alt", self.bme.altitude)
+            drop_count = 0
             while True:
                 c_alt = self.filter.update("alt", self.bme.altitude)
                 acc = self.bno.acceleration
-                mag = math.sqrt(sum(x**2 for x in acc)) if acc[0] is not None else 10
-                if c_alt is not None and abs(c_alt - p_alt) < 0.2 and 9.0 < mag < 11.0: break
+                mag = math.sqrt(sum(x**2 for x in acc)) if acc[0] is not None else 10.0
+                
+                if c_alt is not None and p_alt is not None:
+                    d_alt = c_alt - p_alt
+                    # 自由落下(加速度が小さい) または 降下(高度が急激に低下)
+                    if mag < 4.0 or d_alt < -0.1:
+                        drop_count += 1
+                    else:
+                        drop_count = 0
+                
+                # 3回連続で条件を満たしたら落下と判定
+                if drop_count >= 3:
+                    print("Drop Detected!")
+                    break
+                
                 p_alt = c_alt if c_alt else p_alt
-                self.record(); time.sleep(0.5)
+                self.record(); time.sleep(0.1)
 
-            # 2. 溶断 & 直進
+            # 2. 着陸検知フェーズ
+            self.mode = "FLIGHT"
+            print("Phase: Wait for Landing...")
+            p_alt = self.filter.update("alt", self.bme.altitude)
+            land_count = 0
+            while True:
+                c_alt = self.filter.update("alt", self.bme.altitude)
+                acc = self.bno.acceleration
+                mag = math.sqrt(sum(x**2 for x in acc)) if acc[0] is not None else 10.0
+                
+                if c_alt is not None and p_alt is not None:
+                    d_alt = c_alt - p_alt
+                    # 加速度が1G付近(8〜12) かつ 高度変化がほぼない(|d_alt|<0.05)
+                    if 8.0 < mag < 12.0 and abs(d_alt) < 0.05:
+                        land_count += 1
+                    else:
+                        land_count = 0
+                
+                # 5回連続で条件を満たしたら着陸と判定
+                if land_count >= 5:
+                    print("Landing Detected!")
+                    break
+                
+                p_alt = c_alt if c_alt else p_alt
+                self.record(); time.sleep(0.1)
+
+            # 3. 溶断 & 直進
             self.mode = "MELTING"; self.status = "HEAT_ON"
+            print("Melting (5s)...")
             self.pi.write(NICROME_PIN, 1)
             for _ in range(10): self.record(); time.sleep(0.5)
             self.pi.write(NICROME_PIN, 0); self.status = "HEAT_OFF"
             
             self.mode = "ESCAPE"; self.status = "RUN_3S"
+            print("Escape: 3s Straight")
             self.set_drive(SPEED_STRAIGHT, 0)
             for _ in range(30): self.record(); time.sleep(0.1)
             self.set_drive(0, 0)
 
-            # 3. GPS誘導
+            # 4. GPS誘導
+            print("Starting GPS Guidance...")
             self.mode = "GPS_NAV"
             l_dist, s_cnt = 999, 0
             while True:
@@ -244,11 +288,15 @@ class CanSatMaster:
                     self.status = "STRAIGHT"; self.set_drive(SPEED_STRAIGHT, 0)
                 self.record(); time.sleep(0.1)
 
-            # 4. カメラ誘導
+            # 5. カメラ誘導
+            print("Switched to Camera Guidance")
             self.mode = "CAM_NAV"
             while True:
                 ratio, offset = self.get_red_info()
-                if ratio > RED_RATIO_GOAL: self.status = "GOAL_DET"; break # ゴール判定
+                if ratio > RED_RATIO_GOAL: 
+                    self.status = "GOAL_DET"
+                    print("Goal Detected by Camera!")
+                    break
                 if offset is None:
                     self.status = "SEARCH"; self.set_drive(0, SPEED_TURN)
                 else:
