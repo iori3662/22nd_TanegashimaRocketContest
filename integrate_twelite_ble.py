@@ -35,6 +35,8 @@ from bleak.exc import BleakError
 # ============================================================
 # 真北基準へ変換するための偏角 [deg]
 DECLINATION_DEG = -7.6
+DECLINATION_DEG = 0.0
+HEADING_MOUNT_OFFSET_DEG = -90.0
 
 # ============================================================
 # 0) 共通ユーティリティ
@@ -524,16 +526,22 @@ def run_compass_calibration(
 # 5) リカバリ
 # ============================================================
 @dataclass
+@dataclass
 class RecoveryConfig:
     flip_roll_deg: float = 120.0
     flip_pitch_deg: float = 120.0
 
-    back_ms: int = 900
-    turn_ms: int = 900
-    fwd_ms: int = 600
-    back_power: int = -260
-    turn_power: int = 320
-    fwd_power: int = 260
+    # stuck recovery
+    back_ms: int = 700
+    turn_ms: int = 800
+    fwd_ms: int = 450
+    back_power: int = -180
+    turn_power: int = 220
+    fwd_power: int = 170
+
+    # flip recovery
+    flip_fwd_ms: int = 700
+    flip_fwd_power: int = 220
 
 class RecoveryManager:
     def __init__(self, cfg: RecoveryConfig, drive: ServoDrive, bno, logger=print):
@@ -543,6 +551,7 @@ class RecoveryManager:
         self.log = logger
         self._busy_until = 0.0
         self._state = 0
+        self._mode = None   # "stuck" or "flip"
 
     def _now(self):
         return time.monotonic()
@@ -555,7 +564,7 @@ class RecoveryManager:
 
     def detect_flip(self) -> bool:
         try:
-            e = self.bno.euler
+            e = self.bno.euler  # (heading, roll, pitch)
         except Exception:
             return False
         if e is None:
@@ -569,35 +578,60 @@ class RecoveryManager:
     def start_recover(self, reason: str):
         self.log(f"[REC] start recovery: {reason}")
         self._state = 0
+
+        if "FLIP" in reason.upper():
+            self._mode = "flip"
+        else:
+            self._mode = "stuck"
+
         self._set_busy(1)
 
     def tick(self):
         if not self.is_busy():
             return False
 
-        if self._state == 0:
-            self.drive.set_diff(self.cfg.back_power, 0)
-            self._state = 1
-            self._set_busy(self.cfg.back_ms)
-            return True
+        # ---- flip recovery: 少し前進するだけ ----
+        if self._mode == "flip":
+            if self._state == 0:
+                self.drive.set_diff(self.cfg.flip_fwd_power, 0)
+                self._state = 1
+                self._set_busy(self.cfg.flip_fwd_ms)
+                return True
 
-        if self._state == 1:
-            self.drive.set_diff(0, -self.cfg.turn_power)
-            self._state = 2
-            self._set_busy(self.cfg.turn_ms)
-            return True
+            self.drive.stop()
+            self._busy_until = 0.0
+            self.log("[REC] flip done")
+            return False
 
-        if self._state == 2:
-            self.drive.set_diff(self.cfg.fwd_power, 0)
-            self._state = 3
-            self._set_busy(self.cfg.fwd_ms)
-            return True
+        # ---- stuck recovery: 後退 -> 旋回 -> 前進 ----
+        if self._mode == "stuck":
+            if self._state == 0:
+                self.drive.set_diff(self.cfg.back_power, 0)
+                self._state = 1
+                self._set_busy(self.cfg.back_ms)
+                return True
+
+            if self._state == 1:
+                # 以前逆だったので反転した版
+                self.drive.set_diff(0, -self.cfg.turn_power)
+                self._state = 2
+                self._set_busy(self.cfg.turn_ms)
+                return True
+
+            if self._state == 2:
+                self.drive.set_diff(self.cfg.fwd_power, 0)
+                self._state = 3
+                self._set_busy(self.cfg.fwd_ms)
+                return True
+
+            self.drive.stop()
+            self._busy_until = 0.0
+            self.log("[REC] stuck done")
+            return False
 
         self.drive.stop()
         self._busy_until = 0.0
-        self.log("[REC] done")
         return False
-
 
 # ============================================================
 # 6) GPS誘導
@@ -661,10 +695,6 @@ class GpsGuidance:
             return None
 
     def _get_heading_deg(self) -> float | None:
-        """
-        BNO055の融合済みEuler headingを使用し、
-        偏角を加えて真北基準へ変換する
-        """
         try:
             e = self.bno.euler  # (heading, roll, pitch)
         except Exception:
@@ -674,7 +704,11 @@ class GpsGuidance:
             return None
 
         heading_mag = float(e[0]) % 360.0
-        heading_true = (heading_mag + self.declination_deg) % 360.0
+        heading_true = (
+            heading_mag
+            + self.declination_deg
+            + HEADING_MOUNT_OFFSET_DEG
+        ) % 360.0
 
         self.last_heading_mag = heading_mag
         self.last_heading_true = heading_true
@@ -772,7 +806,7 @@ class GpsGuidance:
             v = 0.0
         elif abs_err > 25.0:
             # 少しだけ前進
-            v = min(v_base, 0.18)
+            v = min(v_base, 0.24)
         else:
             # ほぼ向けているので普通に進む
             v = v_base
@@ -1682,12 +1716,12 @@ def main():
         arrival_radius_m=12.0,   # GPSは粗誘導だけ
         angle_ok_deg=10.0,       # 少し緩める
 
-        base_v=0.42,             # かなり下げる
-        min_v=0.22,              # 近距離はかなり低速
+        base_v=0.52,             # かなり下げる
+        min_v=0.28,              # 近距離はかなり低速
         slowdown_dist_m=20.0,
 
         kp=0.010,                # 旋回ゲインを弱める
-        turn_max=0.38,           # 急旋回しない
+        turn_max=0.42,           # 急旋回しない
         turn_bias=0.00,
 
         stuck_window_sec=8.0,
