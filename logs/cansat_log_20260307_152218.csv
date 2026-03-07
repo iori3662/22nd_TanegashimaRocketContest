@@ -1,0 +1,2 @@
+pc_time,mono_time,elapsed_sec,kind,phase,message,alt_m,acc_x,acc_y,acc_z,acc_norm,mag_x,mag_y,mag_z,euler_heading,euler_roll,euler_pitch,drop_subphase,drop_acc_med,drop_dalt_med,drop_cond,drop_consec,drop_confirmed,drop_armed,drop_baseline_alt,drop_max_alt,gps_lat,gps_lon,gps_fixq,gps_nsat,gps_hdop,gps_dist_m,gps_goal_bearing_deg,gps_heading_deg,gps_err_deg,servo_fwd_cmd,servo_turn_cmd,servo_us18,servo_us12,recovery_mode,recovery_busy,camera_red_ratio,camera_status
+2026-03-07T15:22:18,937.525,,EVENT,,=== CanSat Integrated Program Start ===,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,

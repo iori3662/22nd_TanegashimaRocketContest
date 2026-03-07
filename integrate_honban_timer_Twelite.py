@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+
 import time
 import math
 import statistics
@@ -1295,15 +1296,16 @@ def main():
     )
 
     gps_cfg = GpsConfig(
-        goal_lat=35.66059,
-        goal_lon=139.36688,
+        goal_lat=30.37424850,
+        goal_lon=130.95996700,
         arrival_radius_m=1.0,
-        angle_ok_deg=3.0,
+        angle_ok_deg=5.0,
     )
 
     cam_cfg = CameraConfig(w=480, h=640, show_debug=False)
 
     GPIO_LANDING_PIN = 17
+    GPIO_LED_PIN = 26
     HEADING_EXTRA_OFFSET_DEG = 0.0
 
     FORCE_GPS_AFTER_SEC = 15 * 60
