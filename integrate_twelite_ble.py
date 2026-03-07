@@ -1667,11 +1667,11 @@ def update_basic_telem(telem: TelemetryStore, phase: str, bno, bme, gps_reader: 
 # 13) メイン
 # ============================================================
 def main():
-    fall_cfg = FallConfig(dt=0.10, win=11, req=3, sea_level_hpa=1013.25)
+    fall_cfg = FallConfig(dt=0.10, win=3, req=1, sea_level_hpa=1013.25)
 
     gps_cfg = GpsConfig(
-        goal_lat=35.66059,
-        goal_lon=139.36688,
+        goal_lat=30.38790967,
+        goal_lon=130.94442433,
 
         control_hz=5.0,          # 5Hzで十分
         gps_min_fixq=1,
