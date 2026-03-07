@@ -7,6 +7,9 @@ import time
 import math
 import statistics
 import threading
+import csv
+import os
+from datetime import datetime
 from dataclasses import dataclass
 from collections import deque
 
@@ -26,10 +29,9 @@ import pynmea2
 # ============================================================
 # 方位設定
 # ============================================================
-# 真北基準へ変換するための偏角 [deg]
-# 東偏なら +, 西偏なら -
-# まずは 0.0 で試し、必要に応じて現地値へ調整
-DECLINATION_DEG = 
+DECLINATION_DEG = 0.0  # 現状未使用
+
+
 # ============================================================
 # 0) 共通ユーティリティ
 # ============================================================
@@ -87,6 +89,170 @@ def dm_to_deg(dm, direction):
     val = deg + minutes / 60.0
     return -val if direction in ("S", "W") else val
 
+def safe_read_sensor(fn):
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
+# ============================================================
+# 0.5) CSVロガー
+# ============================================================
+class CsvLogger:
+    def __init__(self, out_dir="logs"):
+        os.makedirs(out_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.path = os.path.join(out_dir, f"cansat_log_{ts}.csv")
+        self.fp = open(self.path, "w", newline="", encoding="utf-8")
+        self.writer = csv.writer(self.fp)
+
+        self.writer.writerow([
+            "pc_time",
+            "mono_time",
+            "elapsed_sec",
+            "kind",
+            "phase",
+            "message",
+
+            "alt_m",
+            "acc_x", "acc_y", "acc_z", "acc_norm",
+            "mag_x", "mag_y", "mag_z",
+            "euler_heading", "euler_roll", "euler_pitch",
+
+            "drop_subphase",
+            "drop_acc_med",
+            "drop_dalt_med",
+            "drop_cond",
+            "drop_consec",
+            "drop_confirmed",
+            "drop_armed",
+            "drop_baseline_alt",
+            "drop_max_alt",
+
+            "gps_lat", "gps_lon", "gps_fixq", "gps_nsat", "gps_hdop",
+            "gps_dist_m", "gps_goal_bearing_deg", "gps_heading_deg", "gps_err_deg",
+
+            "servo_fwd_cmd", "servo_turn_cmd",
+            "servo_us18", "servo_us12",
+
+            "recovery_mode",
+            "recovery_busy",
+            "camera_red_ratio",
+            "camera_status"
+        ])
+        self.fp.flush()
+
+    def log_event(self, msg: str, phase: str = "", elapsed_sec=None):
+        now = datetime.now().isoformat(timespec="seconds")
+        mono = time.monotonic()
+        print(msg)
+        self.writer.writerow([
+            now, f"{mono:.3f}", elapsed_sec, "EVENT", phase, msg,
+            "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "",
+            "", "", "", "", "",
+            "", "", "", "",
+            "", "", "", "",
+            "", "",
+            "", ""
+        ])
+        self.fp.flush()
+
+    def log_row(
+        self,
+        phase="",
+        message="",
+        elapsed_sec=None,
+        alt_m=None,
+        acc=None,
+        mag=None,
+        euler=None,
+        drop_subphase="",
+        drop_acc_med=None,
+        drop_dalt_med=None,
+        drop_cond=None,
+        drop_consec=None,
+        drop_confirmed=None,
+        drop_armed=None,
+        drop_baseline_alt=None,
+        drop_max_alt=None,
+        gps_fix=None,
+        gps_dist_m=None,
+        gps_goal_bearing_deg=None,
+        gps_heading_deg=None,
+        gps_err_deg=None,
+        servo_fwd_cmd=None,
+        servo_turn_cmd=None,
+        servo_us18=None,
+        servo_us12=None,
+        recovery_mode="",
+        recovery_busy=None,
+        camera_red_ratio=None,
+        camera_status=""
+    ):
+        now = datetime.now().isoformat(timespec="seconds")
+        mono = time.monotonic()
+
+        acc_x = acc_y = acc_z = acc_norm = ""
+        if acc is not None and len(acc) == 3:
+            acc_x, acc_y, acc_z = acc
+            acc_norm = norm3(acc)
+
+        mag_x = mag_y = mag_z = ""
+        if mag is not None and len(mag) == 3:
+            mag_x, mag_y, mag_z = mag
+
+        euler_heading = euler_roll = euler_pitch = ""
+        if euler is not None and len(euler) == 3:
+            euler_heading, euler_roll, euler_pitch = euler
+
+        gps_lat = gps_lon = gps_fixq = gps_nsat = gps_hdop = ""
+        if gps_fix is not None:
+            gps_lat = gps_fix.lat
+            gps_lon = gps_fix.lon
+            gps_fixq = gps_fix.fixq
+            gps_nsat = gps_fix.nsat
+            gps_hdop = gps_fix.hdop
+
+        self.writer.writerow([
+            now, f"{mono:.3f}", elapsed_sec, "ROW", phase, message,
+
+            alt_m,
+            acc_x, acc_y, acc_z, acc_norm,
+            mag_x, mag_y, mag_z,
+            euler_heading, euler_roll, euler_pitch,
+
+            drop_subphase,
+            drop_acc_med,
+            drop_dalt_med,
+            drop_cond,
+            drop_consec,
+            drop_confirmed,
+            drop_armed,
+            drop_baseline_alt,
+            drop_max_alt,
+
+            gps_lat, gps_lon, gps_fixq, gps_nsat, gps_hdop,
+            gps_dist_m, gps_goal_bearing_deg, gps_heading_deg, gps_err_deg,
+
+            servo_fwd_cmd, servo_turn_cmd,
+            servo_us18, servo_us12,
+
+            recovery_mode,
+            recovery_busy,
+            camera_red_ratio,
+            camera_status
+        ])
+        self.fp.flush()
+
+    def close(self):
+        try:
+            self.fp.flush()
+            self.fp.close()
+        except Exception:
+            pass
+
 
 # ============================================================
 # 1) pigpio サーボ駆動
@@ -98,23 +264,29 @@ class ServoConfig:
     max_us: int = 2500
     pin18: int = 18
     pin12: int = 12
-
-    # fwd/turn の上限（set_diff）
     max_delta: int = 600
 
 class ServoDrive:
     def __init__(self, pi: pigpio.pi, cfg: ServoConfig):
         self.pi = pi
         self.cfg = cfg
+        self.last_us18 = cfg.stop_us
+        self.last_us12 = cfg.stop_us
+        self.last_fwd = 0
+        self.last_turn = 0
         self.stop()
 
     def _write(self, us18, us12):
         u18 = clamp_int(us18, self.cfg.min_us, self.cfg.max_us)
         u12 = clamp_int(us12, self.cfg.min_us, self.cfg.max_us)
+        self.last_us18 = u18
+        self.last_us12 = u12
         self.pi.set_servo_pulsewidth(self.cfg.pin18, u18)
         self.pi.set_servo_pulsewidth(self.cfg.pin12, u12)
 
     def stop(self):
+        self.last_fwd = 0
+        self.last_turn = 0
         self._write(self.cfg.stop_us, self.cfg.stop_us)
 
     def free(self):
@@ -122,11 +294,9 @@ class ServoDrive:
         self.pi.set_servo_pulsewidth(self.cfg.pin12, 0)
 
     def set_diff(self, fwd, turn):
-        """
-        fwd  > 0 で前進
-        turn > 0 で右旋回（実機に合わせ、内部で符号を反転）
-        """
-        # 実機挙動に合わせて旋回符号を反転（あなたの確定済み設定）
+        self.last_fwd = int(fwd)
+        self.last_turn = int(turn)
+
         turn = -turn
 
         left_power = fwd + turn
@@ -135,27 +305,37 @@ class ServoDrive:
         left_power = clamp_int(left_power, -self.cfg.max_delta, self.cfg.max_delta)
         right_power = clamp_int(right_power, -self.cfg.max_delta, self.cfg.max_delta)
 
-        pulse18 = self.cfg.stop_us - left_power   # pin18: 小さいほど前進
-        pulse12 = self.cfg.stop_us + right_power  # pin12: 大きいほど前進
+        pulse18 = self.cfg.stop_us - left_power
+        pulse12 = self.cfg.stop_us + right_power
         self._write(pulse18, pulse12)
 
 
 # ============================================================
-# 2) 落下検知＋着地判定
+# 2) 落下検知＋着地判定（30mパラシュート降下向け安全側版）
 # ============================================================
 @dataclass
 class FallConfig:
     dt: float = 0.10
-    win: int = 11
-    req: int = 5
+
+    # 降下判定用
+    descent_win: int = 7
+    descent_req: int = 4
+    descent_dalt_th: float = -0.20         # 1サンプルあたりの高度変化中央値がこれ未満で降下
+    descent_from_peak_m: float = 1.5       # 最高高度からこれだけ落ちて初めて降下候補
+
+    # 着地判定用
+    land_win: int = 11
+    land_req: int = 8
+    land_dalt_abs_th: float = 0.06         # 1サンプルあたり高度変化中央値がほぼ0
+    land_alt_span_th: float = 0.30         # 直近窓内の高度振れ幅
+    acc_land_min: float = 8.3
+    acc_land_max: float = 11.3
+
+    # アーム条件
+    arm_alt_rise_m: float = 5.0
+    arm_min_time_sec: float = 2.0
+
     sea_level_hpa: float = 1013.25
-
-    freefall_acc_th: float = 8.5
-    freefall_dalt_th: float = -0.10
-
-    acc_land_min: float = 6.0
-    acc_land_max: float = 13.0
-    land_dalt_abs_th: float = 0.05
 
 @dataclass
 class FallStatus:
@@ -166,26 +346,64 @@ class FallStatus:
     cond: bool | None = None
     consec: int = 0
     confirmed: bool = False
+    armed: bool = False
+    baseline_alt: float | None = None
+    max_alt: float | None = None
 
 class FallLandingDetector:
+    """
+    30mパラシュート降下用に、
+    - 上昇後の連続降下
+    - 着地後の安定
+    を見る安全側ロジック
+    """
     def __init__(self, cfg: FallConfig, logger=print):
         self.cfg = cfg
         self.log = logger
 
-        self.buf_acc = deque(maxlen=cfg.win)
-        self.buf_dalt = deque(maxlen=cfg.win)
-
         self.prev_alt = None
-        self.freefall_confirmed = False
-        self.ff_consec = 0
+        self.t0 = time.monotonic()
+
+        self.baseline_alt = None
+        self.max_alt = None
+        self.armed = False
+
+        self.descent_confirmed = False
+        self.descent_consec = 0
         self.land_consec = 0
+
+        self.buf_acc = deque(maxlen=max(cfg.descent_win, cfg.land_win))
+        self.buf_dalt_desc = deque(maxlen=cfg.descent_win)
+        self.buf_dalt_land = deque(maxlen=cfg.land_win)
+        self.buf_alt_land = deque(maxlen=cfg.land_win)
 
     def update(self, alt_m: float, acc_vec):
         c = self.cfg
 
+        if alt_m is None:
+            return FallStatus(
+                phase="WARMUP",
+                alt=alt_m,
+                armed=self.armed,
+                baseline_alt=self.baseline_alt,
+                max_alt=self.max_alt,
+            )
+
+        if self.baseline_alt is None:
+            self.baseline_alt = alt_m
+            self.max_alt = alt_m
+
+        self.max_alt = max(self.max_alt, alt_m)
+
         if self.prev_alt is None:
             self.prev_alt = alt_m
-            return FallStatus(phase="WARMUP", alt=alt_m)
+            return FallStatus(
+                phase="WARMUP",
+                alt=alt_m,
+                armed=self.armed,
+                baseline_alt=self.baseline_alt,
+                max_alt=self.max_alt,
+            )
 
         dalt = alt_m - self.prev_alt
         self.prev_alt = alt_m
@@ -193,24 +411,110 @@ class FallLandingDetector:
         acc_n = norm3(acc_vec)
         if acc_n is not None:
             self.buf_acc.append(acc_n)
-        self.buf_dalt.append(dalt)
 
-        acc_med = median_or_none(self.buf_acc)
-        dalt_med = median_or_none(self.buf_dalt)
+        self.buf_dalt_desc.append(dalt)
+        self.buf_dalt_land.append(dalt)
+        self.buf_alt_land.append(alt_m)
 
-        if acc_med is None or dalt_med is None:
-            return FallStatus(phase="WARMUP", alt=alt_m)
+        dalt_desc_med = median_or_none(self.buf_dalt_desc)
+        dalt_land_med = median_or_none(self.buf_dalt_land)
+        acc_med = statistics.median(self.buf_acc) if len(self.buf_acc) >= 3 else None
+        alt_span = None
+        if len(self.buf_alt_land) == self.buf_alt_land.maxlen:
+            alt_span = max(self.buf_alt_land) - min(self.buf_alt_land)
 
-        if not self.freefall_confirmed:
-            ff_cond = (acc_med < c.freefall_acc_th) or (dalt_med < c.freefall_dalt_th)
-            self.ff_consec = (self.ff_consec + 1) if ff_cond else 0
-            confirmed = (self.ff_consec >= c.req)
-            return FallStatus("FREEFALL", alt_m, acc_med, dalt_med, ff_cond, self.ff_consec, confirmed)
+        # -------------------------
+        # アーム判定
+        # -------------------------
+        if (not self.armed) and (self.baseline_alt is not None):
+            risen = alt_m - self.baseline_alt
+            elapsed = time.monotonic() - self.t0
+            if (risen >= c.arm_alt_rise_m) and (elapsed >= c.arm_min_time_sec):
+                self.armed = True
+                self.log(f"[DROP] ARMING ON: risen={risen:.2f}m elapsed={elapsed:.1f}s")
 
-        land_cond = ((c.acc_land_min <= acc_med <= c.acc_land_max) or (abs(dalt_med) < c.land_dalt_abs_th))
-        self.land_consec = (self.land_consec + 1) if land_cond else 0
-        confirmed = (self.land_consec >= c.req)
-        return FallStatus("LANDING", alt_m, acc_med, dalt_med, land_cond, self.land_consec, confirmed)
+        if dalt_desc_med is None or dalt_land_med is None:
+            return FallStatus(
+                phase="WARMUP",
+                alt=alt_m,
+                acc_med=acc_med,
+                dalt_med=None,
+                armed=self.armed,
+                baseline_alt=self.baseline_alt,
+                max_alt=self.max_alt,
+            )
+
+        # -------------------------
+        # まだ降下未確認
+        # -------------------------
+        if not self.descent_confirmed:
+            if not self.armed:
+                return FallStatus(
+                    phase="ARM_WAIT",
+                    alt=alt_m,
+                    acc_med=acc_med,
+                    dalt_med=dalt_desc_med,
+                    cond=False,
+                    consec=0,
+                    confirmed=False,
+                    armed=self.armed,
+                    baseline_alt=self.baseline_alt,
+                    max_alt=self.max_alt,
+                )
+
+            drop_from_peak = self.max_alt - alt_m
+
+            # 降下判定は高度主導
+            descent_cond = (
+                (drop_from_peak >= c.descent_from_peak_m) and
+                (dalt_desc_med < c.descent_dalt_th)
+            )
+
+            self.descent_consec = self.descent_consec + 1 if descent_cond else 0
+            confirmed = self.descent_consec >= c.descent_req
+
+            if confirmed:
+                self.descent_confirmed = True
+                self.land_consec = 0
+
+            return FallStatus(
+                phase="DESCENT",
+                alt=alt_m,
+                acc_med=acc_med,
+                dalt_med=dalt_desc_med,
+                cond=descent_cond,
+                consec=self.descent_consec,
+                confirmed=confirmed,
+                armed=self.armed,
+                baseline_alt=self.baseline_alt,
+                max_alt=self.max_alt,
+            )
+
+        # -------------------------
+        # 着地判定
+        # -------------------------
+        acc_ok = True if acc_med is None else (c.acc_land_min <= acc_med <= c.acc_land_max)
+        land_cond = (
+            (abs(dalt_land_med) <= c.land_dalt_abs_th) and
+            (alt_span is not None and alt_span <= c.land_alt_span_th) and
+            acc_ok
+        )
+
+        self.land_consec = self.land_consec + 1 if land_cond else 0
+        confirmed = self.land_consec >= c.land_req
+
+        return FallStatus(
+            phase="LANDING",
+            alt=alt_m,
+            acc_med=acc_med,
+            dalt_med=dalt_land_med,
+            cond=land_cond,
+            consec=self.land_consec,
+            confirmed=confirmed,
+            armed=self.armed,
+            baseline_alt=self.baseline_alt,
+            max_alt=self.max_alt,
+        )
 
 
 # ============================================================
@@ -247,14 +551,12 @@ class GpsConfig:
     min_v: float = 0.35
     slowdown_dist_m: float = 8.0
 
-    # 旋回制御（deg→turn）
-    kp: float = 0.020        # 0.02*90deg=1.8 → 後段で飽和
-    turn_max: float = 0.85   # 0..1
-    turn_bias: float = 0.00  # まずは0推奨
+    kp: float = 0.020
+    turn_max: float = 0.85
+    turn_bias: float = 0.00
 
-    # スタック判定
     stuck_window_sec: float = 6.0
-    stuck_min_progress_m: float = 0.6   # この秒数でこれだけ近づけなければスタック疑い
+    stuck_min_progress_m: float = 0.6
 
 class NmeaGpsReader:
     def __init__(self, cfg: GpsConfig, logger=print):
@@ -336,14 +638,13 @@ class NmeaGpsReader:
 
 
 # ============================================================
-# 4) 磁気キャリブレーション（Qiita方式：max/min→中心）
+# 4) 磁気キャリブレーション
 # ============================================================
 @dataclass
 class CompassCalib:
     valid: bool = False
     off_x: float = 0.0
     off_y: float = 0.0
-    # 取り付け/基準合わせ用（まず0、必要なら180など）
     heading_extra_offset_deg: float = 0.0
 
     def heading_from_mag(self, mag_xyz) -> float | None:
@@ -352,7 +653,6 @@ class CompassCalib:
         mx, my, mz = mag_xyz
         if mx is None or my is None:
             return None
-        # Qiitaの「中心補正」相当：mx,my からオフセットを引く :contentReference[oaicite:3]{index=3}
         x = mx - self.off_x
         y = my - self.off_y
         hdg = math.degrees(math.atan2(y, x))
@@ -368,24 +668,17 @@ def run_compass_calibration(
     turn_power: int = 220,
     logger=print,
 ):
-    """
-    その場回転しながら磁気(x,y)のmax/minを取り、中心=(max+min)/2を推定する。
-    Qiitaの「起動後最初の15秒回転して中心を求める」方式を、BNO055のmagで実装 :contentReference[oaicite:4]{index=4}
-    """
     logger(f"[CAL] Compass calibration start: rotate {duration_sec:.1f}s")
 
     max_x = max_y = None
     min_x = min_y = None
 
     t0 = time.monotonic()
-    # 右回り→左回りで偏り低減（環境依存のため）
     while (time.monotonic() - t0) < duration_sec:
         t = time.monotonic() - t0
-        # 2.5秒ごとに向きを反転
         sign = 1 if int(t / 2.5) % 2 == 0 else -1
         drive.set_diff(0, sign * turn_power)
 
-        mag = None
         try:
             mag = bno.magnetic
         except Exception:
@@ -399,7 +692,6 @@ def run_compass_calibration(
                 max_y = my if (max_y is None or my > max_y) else max_y
                 min_y = my if (min_y is None or my < min_y) else min_y
 
-        # 20Hz程度
         time.sleep(0.05)
 
     drive.stop()
@@ -417,20 +709,22 @@ def run_compass_calibration(
 
 
 # ============================================================
-# 5) リカバリ（スタック/転倒）
+# 5) リカバリ
 # ============================================================
 @dataclass
 class RecoveryConfig:
     flip_roll_deg: float = 120.0
     flip_pitch_deg: float = 120.0
 
-    # リカバリ動作パターン
-    back_ms: int = 900
-    turn_ms: int = 900
-    fwd_ms: int = 600
-    back_power: int = -260
-    turn_power: int = 320
-    fwd_power: int = 260
+    stuck_back_ms: int = 900
+    stuck_turn_ms: int = 900
+    stuck_fwd_ms: int = 600
+    stuck_back_power: int = -260
+    stuck_turn_power: int = 320
+    stuck_fwd_power: int = 260
+
+    flip_fwd_ms: int = 1200
+    flip_fwd_power: int = 320
 
 class RecoveryManager:
     def __init__(self, cfg: RecoveryConfig, drive: ServoDrive, bno, logger=print):
@@ -440,6 +734,7 @@ class RecoveryManager:
         self.log = logger
         self._busy_until = 0.0
         self._state = 0
+        self.mode = None
 
     def _now(self):
         return time.monotonic()
@@ -452,7 +747,7 @@ class RecoveryManager:
 
     def detect_flip(self) -> bool:
         try:
-            e = self.bno.euler  # (heading, roll, pitch)
+            e = self.bno.euler
         except Exception:
             return False
         if e is None:
@@ -466,39 +761,53 @@ class RecoveryManager:
     def start_recover(self, reason: str):
         self.log(f"[REC] start recovery: {reason}")
         self._state = 0
-        self._set_busy(1)  # すぐ次のtickへ
+        self.mode = "FLIP" if "FLIP" in reason.upper() else "STUCK"
+        self._set_busy(1)
 
     def tick(self):
         if not self.is_busy():
-            return False  # not recovering now
+            return False
 
-        # ステートマシン：back → turn → fwd → stop
+        if self.mode == "FLIP":
+            if self._state == 0:
+                self.drive.set_diff(self.cfg.flip_fwd_power, 0)
+                self._state = 1
+                self._set_busy(self.cfg.flip_fwd_ms)
+                return True
+
+            self.drive.stop()
+            self._busy_until = 0.0
+            self.mode = None
+            self.log("[REC] FLIP recovery done")
+            return False
+
         if self._state == 0:
-            self.drive.set_diff(self.cfg.back_power, 0)
+            self.drive.set_diff(self.cfg.stuck_back_power, 0)
             self._state = 1
-            self._set_busy(self.cfg.back_ms)
+            self._set_busy(self.cfg.stuck_back_ms)
             return True
 
         if self._state == 1:
-            self.drive.set_diff(0, self.cfg.turn_power)
+            self.drive.set_diff(0, self.cfg.stuck_turn_power)
             self._state = 2
-            self._set_busy(self.cfg.turn_ms)
+            self._set_busy(self.cfg.stuck_turn_ms)
             return True
 
         if self._state == 2:
-            self.drive.set_diff(self.cfg.fwd_power, 0)
+            self.drive.set_diff(self.cfg.stuck_fwd_power, 0)
             self._state = 3
-            self._set_busy(self.cfg.fwd_ms)
+            self._set_busy(self.cfg.stuck_fwd_ms)
             return True
 
         self.drive.stop()
         self._busy_until = 0.0
-        self.log("[REC] done")
+        self.mode = None
+        self.log("[REC] STUCK recovery done")
         return False
 
 
 # ============================================================
-# 6) GPS誘導コントローラ（左右差制御に修正）
+# 6) GPS誘導
 # ============================================================
 class GpsGuidance:
     def __init__(self, cfg: GpsConfig, drive: ServoDrive, bno, gps_reader: NmeaGpsReader, calib: CompassCalib, logger=print):
@@ -510,11 +819,15 @@ class GpsGuidance:
         self.log = logger
         self._last_log = time.monotonic()
 
-        # スタック判定用
         self._stuck_t0 = None
         self._stuck_d0 = None
+
         self.last_dist = None
+        self.last_goal_bearing = None
+        self.last_heading = None
+        self.last_err = None
         self.last_cmd_fwd = 0.0
+        self.last_cmd_turn = 0.0
 
     def _gps_ok(self, fix: GpsFix) -> bool:
         c = self.cfg
@@ -531,7 +844,6 @@ class GpsGuidance:
         return True
 
     def _get_heading_deg(self) -> float | None:
-        # 優先：補正済み磁気ヘディング（max/min中心補正）
         if self.calib.valid:
             try:
                 mag = self.bno.magnetic
@@ -541,7 +853,6 @@ class GpsGuidance:
             if hdg is not None:
                 return hdg
 
-        # フォールバック：BNO055の融合出力
         try:
             e = self.bno.euler
             if e is not None and e[0] is not None:
@@ -551,16 +862,16 @@ class GpsGuidance:
         return None
 
     def step(self) -> tuple[bool, bool]:
-        """
-        戻り値:
-          (arrived, stuck_suspected)
-        """
         c = self.cfg
         fix = self.gps.get()
         heading = self._get_heading_deg()
 
+        self.last_heading = heading
+
         if heading is None or not self._gps_ok(fix):
             self.drive.stop()
+            self.last_cmd_fwd = 0.0
+            self.last_cmd_turn = 0.0
             return (False, False)
 
         dist = haversine_m(fix.lat, fix.lon, c.goal_lat, c.goal_lon)
@@ -574,28 +885,29 @@ class GpsGuidance:
         theta_goal = bearing_deg(fix.lat, fix.lon, c.goal_lat, c.goal_lon)
         err = wrap_to_180(theta_goal - heading)
 
-        # 距離に応じて前進割合 v を決める
+        self.last_goal_bearing = theta_goal
+        self.last_err = err
+
         if dist < c.slowdown_dist_m:
             a = clamp(dist / c.slowdown_dist_m, 0.0, 1.0)
             v = c.min_v + (c.base_v - c.min_v) * a
         else:
             v = c.base_v
 
-        # 旋回割合 turn（0..1相当）を作る：左右差で効く
         if abs(err) < c.angle_ok_deg:
             turn = c.turn_bias
         else:
             turn = clamp(c.kp * err + c.turn_bias, -c.turn_max, c.turn_max)
 
-        # v,turn を set_diff へ（左右差）
         fwd_power = int(v * self.drive.cfg.max_delta)
         turn_power = int(turn * self.drive.cfg.max_delta)
         self.drive.set_diff(fwd_power, turn_power)
-        self.last_cmd_fwd = v
 
-        # ---- スタック疑い判定：一定時間で距離が減らない ----
+        self.last_cmd_fwd = v
+        self.last_cmd_turn = turn
+
         stuck = False
-        if v >= 0.55:  # ある程度前進指令を出している時だけ監視
+        if v >= 0.55:
             if self._stuck_t0 is None:
                 self._stuck_t0 = time.monotonic()
                 self._stuck_d0 = dist
@@ -604,7 +916,6 @@ class GpsGuidance:
                     progress = (self._stuck_d0 - dist) if (self._stuck_d0 is not None) else 0.0
                     if progress < c.stuck_min_progress_m:
                         stuck = True
-                    # 次窓へ更新
                     self._stuck_t0 = time.monotonic()
                     self._stuck_d0 = dist
         else:
@@ -623,7 +934,7 @@ class GpsGuidance:
 
 
 # ============================================================
-# 7) カメラ誘導（赤コーン）: HSV修正 + 段階スキャン
+# 7) カメラ誘導
 # ============================================================
 @dataclass
 class CameraConfig:
@@ -634,7 +945,6 @@ class CameraConfig:
     kp_turn: float = 0.8
     base_fwd: int = 240
 
-    # SEARCH改善：速すぎる連続回転をやめる
     search_turn: int = 120
     scan_step_sec: float = 0.55
     scan_pause_sec: float = 0.12
@@ -660,13 +970,14 @@ class CameraGuidance:
         self.log = logger
         self._goal_start_t = None
 
-        # SEARCH用
         self._scan_dir = 1
         self._scan_t0 = time.monotonic()
-        self._scan_phase = "TURN"  # TURN / PAUSE
+        self._scan_phase = "TURN"
+
+        self.last_red_ratio = 0.0
+        self.last_status = "INIT"
 
     def _make_red_mask(self, frame_bgr):
-        # ★修正：BGR入力に対してBGR2HSVが正しい
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
         m1 = cv2.inRange(hsv, self.LOWER_RED1, self.UPPER_RED1)
         m2 = cv2.inRange(hsv, self.LOWER_RED2, self.UPPER_RED2)
@@ -703,13 +1014,10 @@ class CameraGuidance:
             if (now - self._scan_t0) >= c.scan_pause_sec:
                 self._scan_phase = "TURN"
                 self._scan_t0 = now
-                # 向きを時々反転（偏り低減）
                 self._scan_dir *= -1
 
     def step(self, frame_bgr) -> bool:
         c = self.cfg
-
-        # 物理設置が時計回り90° → ソフトで反時計回り90°補正
         frame = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
         h, w = frame.shape[:2]
@@ -718,13 +1026,14 @@ class CameraGuidance:
 
         mask = self._make_red_mask(frame)
         red_ratio = cv2.countNonZero(mask) / float(h * w)
+        self.last_red_ratio = red_ratio
 
-        # 0mゴール判定
         if red_ratio >= c.goal_red_ratio:
             if self._goal_start_t is None:
                 self._goal_start_t = time.time()
             elif (time.time() - self._goal_start_t) >= c.goal_hold_sec:
                 self.drive.stop()
+                self.last_status = "GOAL"
                 self.log(f"[CAM] GOAL red_ratio={red_ratio:.3f}")
                 return True
         else:
@@ -748,9 +1057,9 @@ class CameraGuidance:
                 self.drive.set_diff(int(c.base_fwd * 0.35), 0)
                 status = "NEAR_FWD"
             else:
-                # ★改善：連続高速回転をやめ、回して止めて観測
                 self._search_scan()
                 status = "SEARCH_SCAN"
+            self.last_status = status
             self._debug_show(c, frame, mask, status, red_ratio, cx_frame, best_approx)
             return False
 
@@ -762,6 +1071,7 @@ class CameraGuidance:
             else:
                 self._search_scan()
                 status = "M00=0"
+            self.last_status = status
             self._debug_show(c, frame, mask, status, red_ratio, cx_frame, best_approx)
             return False
 
@@ -778,11 +1088,11 @@ class CameraGuidance:
         else:
             turn_gain = 0.55 if red_ratio >= c.slow_red_ratio else 1.0
             turn = int(turn_gain * c.kp_turn * err)
-            # 旋回が強すぎると一瞬で視野外 → 飽和
             turn = clamp_int(turn, -420, 420)
             self.drive.set_diff(0, turn)
             status = "TURN"
 
+        self.last_status = status
         self._debug_show(c, frame, mask, status, red_ratio, cx_frame, best_approx)
         return False
 
@@ -813,7 +1123,7 @@ class Phase:
 
 
 # ============================================================
-# 9) メイン
+# 9) GPIO / 強制処理
 # ============================================================
 def gpio_pulse_high(pi: pigpio.pi, gpio_pin: int, sec: float, logger=print):
     pi.write(gpio_pin, 1)
@@ -822,12 +1132,55 @@ def gpio_pulse_high(pi: pigpio.pi, gpio_pin: int, sec: float, logger=print):
     pi.write(gpio_pin, 0)
     logger(f"[GPIO] PIN{gpio_pin} LOW")
 
+def force_landing_sequence(
+    pi: pigpio.pi,
+    landing_pin: int,
+    drive: ServoDrive,
+    logger=print,
+    pulse_sec: float = 1.0,
+    fwd_power: int = 500,
+    fwd_sec: float = 3.0,
+):
+    logger("[FORCE] landing sequence start")
+    gpio_pulse_high(pi, landing_pin, pulse_sec, logger=logger)
+    drive.set_diff(fwd_power, 0)
+    logger("[FORCE] positive servos...")
+    time.sleep(fwd_sec)
+    drive.stop()
+    logger("[FORCE] landing sequence done")
+
+
+# ============================================================
+# 10) メイン
+# ============================================================
 def main():
-    fall_cfg = FallConfig(dt=0.10, win=11, req=3, sea_level_hpa=1013.25)
+    logger = CsvLogger(out_dir="logs")
+    logger.log_event("=== CanSat Integrated Program Start ===")
+
+    fall_cfg = FallConfig(
+        dt=0.10,
+
+        descent_win=7,
+        descent_req=4,
+        descent_dalt_th=-0.20,
+        descent_from_peak_m=1.5,
+
+        land_win=11,
+        land_req=8,
+        land_dalt_abs_th=0.06,
+        land_alt_span_th=0.30,
+        acc_land_min=8.3,
+        acc_land_max=11.3,
+
+        arm_alt_rise_m=5.0,
+        arm_min_time_sec=2.0,
+
+        sea_level_hpa=1013.25,
+    )
 
     gps_cfg = GpsConfig(
-        goal_lat=35.66059,
-        goal_lon=139.36688,
+        goal_lat=30.38790967,
+        goal_lon=130.94442433,
         arrival_radius_m=1.0,
         angle_ok_deg=3.0,
     )
@@ -835,9 +1188,10 @@ def main():
     cam_cfg = CameraConfig(w=480, h=640, show_debug=False)
 
     GPIO_LANDING_PIN = 17
-
-    # ---- ここを必要なら変更（0 or 180などで即テスト可能）----
     HEADING_EXTRA_OFFSET_DEG = 0.0
+
+    FORCE_GPS_AFTER_SEC = 15 * 60
+    FORCE_DONE_AFTER_SEC = 25 * 60
 
     pi = pigpio.pi()
     if not pi.connected:
@@ -854,72 +1208,234 @@ def main():
     bme = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=0x76)
     bme.sea_level_pressure = fall_cfg.sea_level_hpa
 
-    detector = FallLandingDetector(fall_cfg, logger=print)
+    detector = FallLandingDetector(fall_cfg, logger=logger.log_event)
 
-    gps_reader = NmeaGpsReader(gps_cfg, logger=print)
+    gps_reader = NmeaGpsReader(gps_cfg, logger=logger.log_event)
     gps_reader.start()
 
     calib = CompassCalib(valid=False, heading_extra_offset_deg=HEADING_EXTRA_OFFSET_DEG)
-    gps_guidance = GpsGuidance(gps_cfg, drive, bno, gps_reader, calib, logger=print)
+    gps_guidance = GpsGuidance(gps_cfg, drive, bno, gps_reader, calib, logger=logger.log_event)
 
     rec_cfg = RecoveryConfig()
-    recovery = RecoveryManager(rec_cfg, drive, bno, logger=print)
+    recovery = RecoveryManager(rec_cfg, drive, bno, logger=logger.log_event)
 
-    cam_guidance = CameraGuidance(cam_cfg, drive, logger=print)
+    cam_guidance = CameraGuidance(cam_cfg, drive, logger=logger.log_event)
     picam2 = None
 
+    mission_t0 = time.monotonic()
+    forced_gps_done = False
+
     phase = Phase.DROP
-    print("=== CanSat Integrated Program Start ===")
-    print(f"Phase: {phase}")
+    logger.log_event(f"Phase: {phase}", phase=phase, elapsed_sec=0.0)
+    logger.log_event(
+        f"[TIMER] force_gps={FORCE_GPS_AFTER_SEC}s force_done={FORCE_DONE_AFTER_SEC}s",
+        phase=phase,
+        elapsed_sec=0.0
+    )
 
     try:
         while phase != Phase.DONE:
-            # どのフェーズでも転倒復帰は最優先（センサが取れるときのみ）
+            elapsed = time.monotonic() - mission_t0
+
+            if elapsed >= FORCE_DONE_AFTER_SEC and phase != Phase.DONE:
+                logger.log_event(
+                    f"[TIMER] FORCE DONE at {elapsed:.1f}s (mission timeout)",
+                    phase=phase,
+                    elapsed_sec=elapsed
+                )
+                drive.stop()
+                phase = Phase.DONE
+                logger.log_event(f"Phase: {phase}", phase=phase, elapsed_sec=elapsed)
+                continue
+
+            if (elapsed >= FORCE_GPS_AFTER_SEC) and (not forced_gps_done):
+                if phase in (Phase.DROP, Phase.CALIB):
+                    logger.log_event(
+                        f"[TIMER] FORCE GPS TRANSITION at {elapsed:.1f}s",
+                        phase=phase,
+                        elapsed_sec=elapsed
+                    )
+
+                    force_landing_sequence(
+                        pi=pi,
+                        landing_pin=GPIO_LANDING_PIN,
+                        drive=drive,
+                        logger=logger.log_event,
+                        pulse_sec=1.0,
+                        fwd_power=500,
+                        fwd_sec=3.0,
+                    )
+
+                    detector.descent_confirmed = True
+                    detector.land_consec = fall_cfg.land_req
+
+                    drive.stop()
+                    phase = Phase.GPS
+                    forced_gps_done = True
+                    logger.log_event(f"Phase: {phase}", phase=phase, elapsed_sec=elapsed)
+                    continue
+                else:
+                    forced_gps_done = True
+
+            alt = safe_read_sensor(lambda: bme.altitude)
+            acc = safe_read_sensor(lambda: bno.acceleration)
+            mag = safe_read_sensor(lambda: bno.magnetic)
+            euler = safe_read_sensor(lambda: bno.euler)
+            gps_fix = gps_reader.get()
+
             if not recovery.is_busy() and recovery.detect_flip() and phase != Phase.DROP:
                 recovery.start_recover("FLIP detected")
+
             if recovery.is_busy():
                 recovery.tick()
+                logger.log_row(
+                    phase=phase,
+                    message="recovering",
+                    elapsed_sec=elapsed,
+                    alt_m=alt,
+                    acc=acc,
+                    mag=mag,
+                    euler=euler,
+                    gps_fix=gps_fix,
+                    servo_fwd_cmd=drive.last_fwd,
+                    servo_turn_cmd=drive.last_turn,
+                    servo_us18=drive.last_us18,
+                    servo_us12=drive.last_us12,
+                    recovery_mode=recovery.mode,
+                    recovery_busy=True,
+                )
                 time.sleep(0.05)
                 continue
 
             if phase == Phase.DROP:
-                alt = bme.altitude
-                acc = bno.acceleration
                 st = detector.update(alt, acc)
 
                 if st.phase == "WARMUP":
+                    logger.log_row(
+                        phase=phase,
+                        message="warmup",
+                        elapsed_sec=elapsed,
+                        alt_m=alt,
+                        acc=acc,
+                        mag=mag,
+                        euler=euler,
+                        drop_subphase=st.phase,
+                        drop_acc_med=st.acc_med,
+                        drop_dalt_med=st.dalt_med,
+                        drop_cond=st.cond,
+                        drop_consec=st.consec,
+                        drop_confirmed=st.confirmed,
+                        drop_armed=st.armed,
+                        drop_baseline_alt=st.baseline_alt,
+                        drop_max_alt=st.max_alt,
+                        gps_fix=gps_fix,
+                        servo_fwd_cmd=drive.last_fwd,
+                        servo_turn_cmd=drive.last_turn,
+                        servo_us18=drive.last_us18,
+                        servo_us12=drive.last_us12,
+                        recovery_mode=recovery.mode,
+                        recovery_busy=False,
+                    )
                     time.sleep(fall_cfg.dt)
                     continue
 
-                if st.phase == "FREEFALL":
-                    print(f"[DROP] FREEFALL? alt={st.alt:.2f} acc_med={st.acc_med:.2f} "
-                          f"dalt_med={st.dalt_med:.3f} cond={st.cond} consec={st.consec}")
+                if st.phase == "ARM_WAIT":
+                    logger.log_event(
+                        f"[DROP] ARM_WAIT alt={st.alt:.2f} acc_med={st.acc_med} dalt_med={st.dalt_med:.3f} "
+                        f"baseline={st.baseline_alt:.2f} max_alt={st.max_alt:.2f}",
+                        phase=phase,
+                        elapsed_sec=elapsed
+                    )
+                    logger.log_row(
+                        phase=phase,
+                        message="arm_wait",
+                        elapsed_sec=elapsed,
+                        alt_m=alt,
+                        acc=acc,
+                        mag=mag,
+                        euler=euler,
+                        drop_subphase=st.phase,
+                        drop_acc_med=st.acc_med,
+                        drop_dalt_med=st.dalt_med,
+                        drop_cond=st.cond,
+                        drop_consec=st.consec,
+                        drop_confirmed=st.confirmed,
+                        drop_armed=st.armed,
+                        drop_baseline_alt=st.baseline_alt,
+                        drop_max_alt=st.max_alt,
+                        gps_fix=gps_fix,
+                        servo_fwd_cmd=drive.last_fwd,
+                        servo_turn_cmd=drive.last_turn,
+                        servo_us18=drive.last_us18,
+                        servo_us12=drive.last_us12,
+                        recovery_mode=recovery.mode,
+                        recovery_busy=False,
+                    )
+                    time.sleep(fall_cfg.dt)
+                    continue
+
+                if st.phase == "DESCENT":
+                    logger.log_event(
+                        f"[DROP] DESCENT? alt={st.alt:.2f} acc_med={st.acc_med} "
+                        f"dalt_med={st.dalt_med:.3f} cond={st.cond} consec={st.consec}",
+                        phase=phase,
+                        elapsed_sec=elapsed
+                    )
                     if st.confirmed:
-                        detector.freefall_confirmed = True
-                        detector.land_consec = 0
-                        print("[DROP] FREEFALL CONFIRMED")
+                        logger.log_event("[DROP] DESCENT CONFIRMED", phase=phase, elapsed_sec=elapsed)
 
                 elif st.phase == "LANDING":
-                    print(f"[DROP] LAND? alt={st.alt:.2f} acc_med={st.acc_med:.2f} "
-                          f"dalt_med={st.dalt_med:.3f} cond={st.cond} consec={st.consec}")
+                    logger.log_event(
+                        f"[DROP] LAND? alt={st.alt:.2f} acc_med={st.acc_med} "
+                        f"dalt_med={st.dalt_med:.3f} cond={st.cond} consec={st.consec}",
+                        phase=phase,
+                        elapsed_sec=elapsed
+                    )
                     if st.confirmed:
-                        print("[DROP] LANDING CONFIRMED")
-                        gpio_pulse_high(pi, GPIO_LANDING_PIN, 1.0, logger=print)
-                        
-                        drive.set_diff(500, 0)
-                        print("Positive servos...")
-                        time.sleep(3)
-                        drive.stop()
-                        print("Stopping servos...")
+                        logger.log_event("[DROP] LANDING CONFIRMED", phase=phase, elapsed_sec=elapsed)
 
-                        # ★追加：キャリブレーションへ
+                        force_landing_sequence(
+                            pi=pi,
+                            landing_pin=GPIO_LANDING_PIN,
+                            drive=drive,
+                            logger=logger.log_event,
+                            pulse_sec=1.0,
+                            fwd_power=500,
+                            fwd_sec=3.0,
+                        )
+
                         phase = Phase.CALIB
-                        print(f"Phase: {phase}")
+                        logger.log_event(f"Phase: {phase}", phase=phase, elapsed_sec=elapsed)
+
+                logger.log_row(
+                    phase=phase,
+                    message="drop_step",
+                    elapsed_sec=elapsed,
+                    alt_m=alt,
+                    acc=acc,
+                    mag=mag,
+                    euler=euler,
+                    drop_subphase=st.phase,
+                    drop_acc_med=st.acc_med,
+                    drop_dalt_med=st.dalt_med,
+                    drop_cond=st.cond,
+                    drop_consec=st.consec,
+                    drop_confirmed=st.confirmed,
+                    drop_armed=st.armed,
+                    drop_baseline_alt=st.baseline_alt,
+                    drop_max_alt=st.max_alt,
+                    gps_fix=gps_fix,
+                    servo_fwd_cmd=drive.last_fwd,
+                    servo_turn_cmd=drive.last_turn,
+                    servo_us18=drive.last_us18,
+                    servo_us12=drive.last_us12,
+                    recovery_mode=recovery.mode,
+                    recovery_busy=False,
+                )
 
                 time.sleep(fall_cfg.dt)
                 continue
 
-            # --- 追加フェーズ：磁気キャリブ（15秒回転）---
             if phase == Phase.CALIB:
                 drive.stop()
                 time.sleep(0.2)
@@ -929,10 +1445,10 @@ def main():
                     calib=calib,
                     duration_sec=15.0,
                     turn_power=220,
-                    logger=print,
+                    logger=logger.log_event,
                 )
                 phase = Phase.GPS
-                print(f"Phase: {phase}")
+                logger.log_event(f"Phase: {phase}", phase=phase, elapsed_sec=elapsed)
                 continue
 
             if phase == Phase.GPS:
@@ -944,7 +1460,28 @@ def main():
                     recovery.start_recover("STUCK suspected (GPS progress low)")
                 if arrived:
                     phase = Phase.CAMERA
-                    print(f"Phase: {phase}")
+                    logger.log_event(f"Phase: {phase}", phase=phase, elapsed_sec=elapsed)
+
+                logger.log_row(
+                    phase=phase,
+                    message="gps_step",
+                    elapsed_sec=elapsed,
+                    alt_m=alt,
+                    acc=acc,
+                    mag=mag,
+                    euler=euler,
+                    gps_fix=gps_fix,
+                    gps_dist_m=gps_guidance.last_dist,
+                    gps_goal_bearing_deg=gps_guidance.last_goal_bearing,
+                    gps_heading_deg=gps_guidance.last_heading,
+                    gps_err_deg=gps_guidance.last_err,
+                    servo_fwd_cmd=drive.last_fwd,
+                    servo_turn_cmd=drive.last_turn,
+                    servo_us18=drive.last_us18,
+                    servo_us12=drive.last_us12,
+                    recovery_mode=recovery.mode,
+                    recovery_busy=False,
+                )
 
                 time.sleep(max(0.0, dt - (time.monotonic() - t0)))
                 continue
@@ -959,20 +1496,56 @@ def main():
                     picam2.start()
                     time.sleep(0.3)
                     drive.stop()
-                    print("[CAM] Camera started")
+                    logger.log_event("[CAM] Camera started", phase=phase, elapsed_sec=elapsed)
 
                 frame = picam2.capture_array("main")
                 if frame is None:
+                    logger.log_row(
+                        phase=phase,
+                        message="camera_frame_none",
+                        elapsed_sec=elapsed,
+                        alt_m=alt,
+                        acc=acc,
+                        mag=mag,
+                        euler=euler,
+                        gps_fix=gps_fix,
+                        servo_fwd_cmd=drive.last_fwd,
+                        servo_turn_cmd=drive.last_turn,
+                        servo_us18=drive.last_us18,
+                        servo_us12=drive.last_us12,
+                        recovery_mode=recovery.mode,
+                        recovery_busy=False,
+                    )
                     continue
 
                 goal = cam_guidance.step(frame)
+
+                logger.log_row(
+                    phase=phase,
+                    message="camera_step",
+                    elapsed_sec=elapsed,
+                    alt_m=alt,
+                    acc=acc,
+                    mag=mag,
+                    euler=euler,
+                    gps_fix=gps_fix,
+                    servo_fwd_cmd=drive.last_fwd,
+                    servo_turn_cmd=drive.last_turn,
+                    servo_us18=drive.last_us18,
+                    servo_us12=drive.last_us12,
+                    recovery_mode=recovery.mode,
+                    recovery_busy=False,
+                    camera_red_ratio=cam_guidance.last_red_ratio,
+                    camera_status=cam_guidance.last_status,
+                )
+
                 if goal:
                     phase = Phase.DONE
-                    print(f"Phase: {phase}")
+                    logger.log_event(f"Phase: {phase}", phase=phase, elapsed_sec=elapsed)
                 continue
 
     except KeyboardInterrupt:
-        print("Ctrl-C")
+        logger.log_event("Ctrl-C", elapsed_sec=(time.monotonic() - mission_t0))
     finally:
         try:
             drive.stop()
@@ -999,7 +1572,11 @@ def main():
             pi.stop()
         except Exception:
             pass
-        print("=== Finish ===")
+        logger.log_event(
+            f"=== Finish === CSV: {logger.path}",
+            elapsed_sec=(time.monotonic() - mission_t0)
+        )
+        logger.close()
 
 if __name__ == "__main__":
     main()
