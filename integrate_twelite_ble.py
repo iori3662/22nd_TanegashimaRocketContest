@@ -1815,7 +1815,7 @@ def main():
     print(f"Phase: {phase}")
 
     try:
-        while phase != Phase.DONE and phase != Phase.DROP:
+        while phase != Phase.DONE:
             update_basic_telem(telem, phase, bno, bme, gps_reader, drive, recovery, calib, ble_ctrl)
                         # ---- BLE remote requested phase change ----
             req_idx = ble_ctrl.consume_phase_request()
