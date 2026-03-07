@@ -135,8 +135,12 @@ class ServoDrive:
         self.last_u12 = cfg.stop_us
         self.last_fwd = 0
         self.last_turn = 0
+        self._cmd_fwd_now = 0
+        self._cmd_turn_now = 0
+        self.max_step_fwd = 35
+        self.max_step_turn = 45
         self.stop()
-
+        
     def _write(self, us18, us12):
         u18 = clamp_int(us18, self.cfg.min_us, self.cfg.max_us)
         u12 = clamp_int(us12, self.cfg.min_us, self.cfg.max_us)
@@ -154,18 +158,29 @@ class ServoDrive:
         self.pi.set_servo_pulsewidth(self.cfg.pin18, 0)
         self.pi.set_servo_pulsewidth(self.cfg.pin12, 0)
 
+    def _slew(self, target, current, step):
+        if target > current + step:
+            return current + step
+        if target < current - step:
+            return current - step
+        return target
+
     def set_diff(self, fwd, turn):
         """
         fwd  > 0 で前進
         turn > 0 で右旋回（実機に合わせ内部で符号反転）
         """
-        self.last_fwd = int(fwd)
-        self.last_turn = int(turn)
+        # 指令変化をなめらかにする
+        self._cmd_fwd_now = self._slew(int(fwd), self._cmd_fwd_now, self.max_step_fwd)
+        self._cmd_turn_now = self._slew(int(turn), self._cmd_turn_now, self.max_step_turn)
 
-        turn = -turn
+        self.last_fwd = self._cmd_fwd_now
+        self.last_turn = self._cmd_turn_now
 
-        left_power = fwd + turn
-        right_power = fwd - turn
+        turn_internal = -self._cmd_turn_now
+
+        left_power = self._cmd_fwd_now + turn_internal
+        right_power = self._cmd_fwd_now - turn_internal
 
         left_power = clamp_int(left_power, -self.cfg.max_delta, self.cfg.max_delta)
         right_power = clamp_int(right_power, -self.cfg.max_delta, self.cfg.max_delta)
@@ -395,8 +410,18 @@ class MedianLatLonFilter:
         return lat_f, lon_f
     
 class GpsFilter:
+    """
+    緯度・経度に対して
+      1) 中央値フィルタ
+      2) 平均フィルタ
+    をかける簡易フィルタ
 
-    def __init__(self, med_window=7, avg_window=3):
+    GPS 1Hz想定なら、
+      med_window=5, avg_window=3
+    くらいが実戦向きです。
+    """
+
+    def __init__(self, med_window=5, avg_window=3):
         self.lat_med_buf = deque(maxlen=med_window)
         self.lon_med_buf = deque(maxlen=med_window)
 
@@ -404,18 +429,17 @@ class GpsFilter:
         self.lon_avg_buf = deque(maxlen=avg_window)
 
     def update(self, lat, lon):
-
         if lat is None or lon is None:
             return None, None
 
-        # --- median ---
+        # --- まず中央値 ---
         self.lat_med_buf.append(lat)
         self.lon_med_buf.append(lon)
 
         lat_med = statistics.median(self.lat_med_buf)
         lon_med = statistics.median(self.lon_med_buf)
 
-        # --- average ---
+        # --- その後平均 ---
         self.lat_avg_buf.append(lat_med)
         self.lon_avg_buf.append(lon_med)
 
@@ -558,7 +582,7 @@ class RecoveryManager:
             return True
 
         if self._state == 1:
-            self.drive.set_diff(0, self.cfg.turn_power)
+            self.drive.set_diff(0, -self.cfg.turn_power)
             self._state = 2
             self._set_busy(self.cfg.turn_ms)
             return True
@@ -579,20 +603,28 @@ class RecoveryManager:
 # 6) GPS誘導
 # ============================================================
 class GpsGuidance:
-    def __init__(self, cfg: GpsConfig, drive: ServoDrive, bno, gps_reader: NmeaGpsReader,
-                 calib: CompassCalib, declination_deg: float = 0.0, logger=print):
+    def __init__(self, cfg, drive, bno, gps_reader, calib,
+                 declination_deg: float = 0.0, logger=print):
         self.cfg = cfg
         self.drive = drive
         self.bno = bno
         self.gps = gps_reader
-        self.calib = calib
+        self.calib = calib   # 互換のため残すが、heading生成には使わない
         self.declination_deg = declination_deg
         self.log = logger
         self._last_log = time.monotonic()
 
+        # スタック判定用
         self._stuck_t0 = None
         self._stuck_d0 = None
 
+        # フィルタ済みGPS
+        self.gps_filter = GpsFilter(med_window=5, avg_window=3)
+
+        # bearingの急変抑制用
+        self._theta_goal_lp = None
+
+        # デバッグ用
         self.last_dist = None
         self.last_theta_goal = None
         self.last_heading = None
@@ -602,13 +634,10 @@ class GpsGuidance:
         self.last_turn_cmd = 0.0
         self.last_cmd_fwd = 0.0
         self.last_calib_stat = None
+        self.last_lat_f = None
+        self.last_lon_f = None
 
-        self.pos_filter = MedianLatLonFilter(window=5)
-
-        # bearing の急変を抑える
-        self._theta_goal_lp = None
-
-    def _gps_ok(self, fix: GpsFix) -> bool:
+    def _gps_ok(self, fix) -> bool:
         c = self.cfg
         if fix.lat is None or fix.lon is None:
             return False
@@ -632,8 +661,12 @@ class GpsGuidance:
             return None
 
     def _get_heading_deg(self) -> float | None:
+        """
+        BNO055の融合済みEuler headingを使用し、
+        偏角を加えて真北基準へ変換する
+        """
         try:
-            e = self.bno.euler
+            e = self.bno.euler  # (heading, roll, pitch)
         except Exception:
             return None
 
@@ -674,12 +707,16 @@ class GpsGuidance:
             self.last_cmd_fwd = 0.0
             return (False, False)
 
-        # ---- 緯度経度を中央値フィルタ ----
+        # ---- GPS位置フィルタ ----
         lat_f, lon_f = self.gps_filter.update(fix.lat, fix.lon)
         if lat_f is None or lon_f is None:
             self.drive.stop()
             return (False, False)
 
+        self.last_lat_f = lat_f
+        self.last_lon_f = lon_f
+
+        # ---- 距離 ----
         dist = haversine_m(lat_f, lon_f, c.goal_lat, c.goal_lon)
         self.last_dist = dist
 
@@ -691,11 +728,10 @@ class GpsGuidance:
             self.log(f"[GPS] DONE -> CAMERA dist={dist:.2f}m <= {c.arrival_radius_m}m")
             return (True, False)
 
-        # ---- goal bearing を計算 ----
+        # ---- ゴール方位（真北基準） ----
         theta_goal_raw = bearing_deg(lat_f, lon_f, c.goal_lat, c.goal_lon)
 
-        # bearing の急変を抑える
-        # 遠距離では追従性重視、中距離では安定性重視
+        # bearingの急変を抑える
         if dist > 20.0:
             alpha = 0.35
         else:
@@ -705,6 +741,7 @@ class GpsGuidance:
         self._theta_goal_lp = theta_goal
         self.last_theta_goal = theta_goal
 
+        # ---- 方位誤差 ----
         err = wrap_to_180(theta_goal - heading)
         self.last_err = err
 
@@ -727,17 +764,15 @@ class GpsGuidance:
         if dist <= 20.0:
             turn *= 0.75
 
-        # ---- 誤差に応じて前進を制限 ----
+        # ---- 方位誤差が大きいときは前進を抑える ----
         abs_err = abs(err)
 
         if abs_err > 60.0:
             # まず向きを合わせる
             v = 0.0
-
         elif abs_err > 25.0:
             # 少しだけ前進
-            v = min(v_base, 0.28)
-
+            v = min(v_base, 0.18)
         else:
             # ほぼ向けているので普通に進む
             v = v_base
@@ -750,7 +785,7 @@ class GpsGuidance:
         self.last_turn_cmd = turn
 
         # ---- スタック判定 ----
-        # 近距離では GPS ノイズで誤判定しやすいので無効化
+        # 近距離では GPSノイズで誤判定しやすいので無効化
         stuck = False
         if dist > 20.0 and v >= 0.50:
             if self._stuck_t0 is None:
@@ -1638,20 +1673,25 @@ def main():
         goal_lat=35.66059,
         goal_lon=139.36688,
 
-        control_hz=5.0,          # 10Hz→5Hzで十分
-        arrival_radius_m=10.0,   # GPS到達判定を大きく
-        angle_ok_deg=8.0,        # 少し緩める
+        control_hz=5.0,          # 5Hzで十分
+        gps_min_fixq=1,
+        gps_min_sats=5,
+        gps_max_hdop=3.0,        # 少し厳しめ
+        gps_stale_sec=2.5,
 
-        base_v=0.62,
-        min_v=0.38,
+        arrival_radius_m=12.0,   # GPSは粗誘導だけ
+        angle_ok_deg=10.0,       # 少し緩める
+
+        base_v=0.42,             # かなり下げる
+        min_v=0.22,              # 近距離はかなり低速
         slowdown_dist_m=20.0,
 
-        kp=0.012,                # 旋回ゲインを下げる
-        turn_max=0.55,           # 飽和を弱める
+        kp=0.010,                # 旋回ゲインを弱める
+        turn_max=0.38,           # 急旋回しない
         turn_bias=0.00,
 
         stuck_window_sec=8.0,
-        stuck_min_progress_m=1.0
+        stuck_min_progress_m=1.0,
     )
 
     cam_cfg = CameraConfig(w=480, h=640, show_debug=False)
@@ -1701,7 +1741,18 @@ def main():
         logger=print
     )
 
-    rec_cfg = RecoveryConfig()
+    rec_cfg = RecoveryConfig(
+        flip_roll_deg=120.0,
+        flip_pitch_deg=120.0,
+
+        back_ms=700,
+        turn_ms=800,
+        fwd_ms=450,
+
+        back_power=-180,
+        turn_power=220,
+        fwd_power=170,
+    )
     recovery = RecoveryManager(rec_cfg, drive, bno, logger=print)
 
     cam_guidance = CameraGuidance(cam_cfg, drive, logger=print)
@@ -1730,7 +1781,7 @@ def main():
     print(f"Phase: {phase}")
 
     try:
-        while phase != Phase.DONE:
+        while phase != Phase.DONE and phase != Phase.DROP:
             update_basic_telem(telem, phase, bno, bme, gps_reader, drive, recovery, calib, ble_ctrl)
                         # ---- BLE remote requested phase change ----
             req_idx = ble_ctrl.consume_phase_request()
@@ -1818,9 +1869,9 @@ def main():
                         gpio_pulse_high(pi, GPIO_LANDING_PIN, 1.0, logger=print)
 
                         # 着地直後に2輪を前進側へ3秒回して展開/離脱動作
-                        drive.set_diff(350, 0)
+                        drive.set_diff(180, 0)
                         print("[DROP] drive forward 3s after landing")
-                        time.sleep(3.0)
+                        time.sleep(5.0)
                         drive.stop()
 
                         phase = Phase.GPS
